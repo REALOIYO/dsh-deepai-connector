@@ -1,0 +1,97 @@
+{
+  "name": "dsh-deepai-connector",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "DeepAI Code 模型接入 DeepSeek Harness：浏览器 OAuth 登录直连上游，不需要安装 DeepAI Code 桌面客户端，也不需要额外的网关进程。",
+  "author": "REALOIYO <115921813+REALOIYO@users.noreply.github.com> (https://github.com/REALOIYO)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/REALOIYO/dsh-deepai-connector.git"
+  },
+  "homepage": "https://github.com/REALOIYO/dsh-deepai-connector#readme",
+  "bugs": {
+    "url": "https://github.com/REALOIYO/dsh-deepai-connector/issues"
+  },
+  "main": "./src/index.ts",
+  "exports": {
+    ".": {
+      "default": "./src/index.ts"
+    },
+    "./client": {
+      "default": "./src/adapter/client.ts"
+    },
+    "./package.json": "./package.json"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepai",
+    "deepai-code",
+    "llm-adapter",
+    "llm-provider"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.2.0-rc.1 <0.3.0-0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@earendil-works/pi-ai": "^0.82.1",
+    "react": ">=18",
+    "@deepseek-ai/dsh-client-ui-renderer": "*",
+    "@deepseek-ai/dsh-client-locale": "*",
+    "@deepseek-ai/dsh-client-ui-primitives": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-renderer": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-locale": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-primitives": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test \"test/*.test.ts\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "verify:real": "node scripts/verify-real.mjs"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "dsh.plugin.json",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ],
+      "platform": "web"
+    }
+  }
+}

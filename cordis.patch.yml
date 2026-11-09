@@ -1,0 +1,8 @@
+# dsh-deepai-connector — bundle patch：插入插件行（部署级）。
+#
+# 默认值无需改动：插件在进程内直接连上游，不起子进程、不占端口。
+# 首次使用要在「设置 → DeepAI Code」完成一次浏览器授权，之后 Key 落盘复用。
+- insert:
+    - id: deepai
+      name: 'dsh-deepai-connector'
+      config: {}
