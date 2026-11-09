@@ -154,6 +154,9 @@ export class DeepAIAdapter {
   ): Promise<{ model: ResolvedModel; stream: (options: GenerateOptions) => AsyncGenerator<StreamChunk> }> {
     if (!this.#catalog.live) await this.#catalog.refresh()
 
+    // 必须在这里补一次 load：插件启动时可能还没登录，账号是之后在设置页
+    // 登录写进去的。只在启动时读一次盘会导致「登录成功但仍报未登录」。
+    await this.#store.load()
     const account = this.#store.get()
     if (account === undefined) {
       throw new Error('deepai: 还没登录，请在「设置 → DeepAI Code」完成一次授权')
@@ -176,7 +179,6 @@ export class DeepAIAdapter {
     const account = this.#store.get()
     if (account === undefined) throw new Error('deepai: 还没登录')
     this.#client.setApiKey(account.apiKey)
-
     // 推理前确保签到：上游拿这个判定是不是真客户端。
     // 失败不阻塞 —— 只影响落到真分支还是替身分支。
     await this.#client.ensureCheckIn(options.signal)
