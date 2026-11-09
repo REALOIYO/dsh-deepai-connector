@@ -24,7 +24,7 @@
 
 import type { AccountStore } from './auth.ts'
 import { buildChatBody } from './body.ts'
-import { ModelCatalog, acceptsImage, contextWindowOf, endpointFor, maxTokensOf } from './catalog.ts'
+import { ModelCatalog, acceptsImage, contextWindowOf, endpointFor, isFree, maxTokensOf } from './catalog.ts'
 import { DeepAIClient, UpstreamError } from './client.ts'
 import type { GenerateOptions } from './body.ts'
 import { toStreamChunks, type StreamChunk } from './stream.ts'
@@ -63,6 +63,18 @@ const REASONING_EFFORTS = [
   { id: 'medium', name: '中' },
   { id: 'high', name: '高' },
 ] as const
+
+/**
+ * 模型在选择器里显示的文案。
+ *
+ * DSH 的模型选择器只渲染 `name`，没有徽章插槽，所以把「免费」直接拼进名字。
+ * 上游用 `theosPerRequest === "0"` 表示免费，判定见 `catalog.isFree`。
+ */
+export function displayNameOf(model: { name?: string; id: string; theosPerRequest?: string; premier?: boolean } | undefined): string {
+  if (model === undefined) return ''
+  const base = model.name !== undefined && model.name !== '' ? model.name : model.id
+  return isFree(model) ? `${base} · 免费` : base
+}
 
 export class DeepAIAdapter {
   readonly #providerId: string
@@ -115,12 +127,17 @@ export class DeepAIAdapter {
     return undefined
   }
 
-  /** 模型列表（DSH 的模型选择器读这个）。 */
+  /**
+   * 模型列表（DSH 的模型选择器读这个）。
+   *
+   * `name` 是选择器里唯一能控制的显示文案，所以把免费标记拼在这里。
+   * DSH 的选择器只渲染 `name`，没有额外的徽章插槽。
+   */
   listModels(provider: string): Array<{ provider: string; id: string; name: string; inputModalities: string[] }> {
     return this.#catalog.list().map(model => ({
       provider,
       id: model.id,
-      name: model.name ?? model.id,
+      name: displayNameOf(model),
       inputModalities: acceptsImage(model) ? ['text', 'image'] : ['text'],
     }))
   }
@@ -131,7 +148,7 @@ export class DeepAIAdapter {
     const resolved: ResolvedModel = {
       provider,
       id: model,
-      name: entry?.name ?? model,
+      name: displayNameOf(entry),
       inputModalities: acceptsImage(entry) ? ['text', 'image'] : ['text'],
       context: { contextWindow: contextWindowOf(entry) },
       defaultMaxTokens: maxTokensOf(entry),

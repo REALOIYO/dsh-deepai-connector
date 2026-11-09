@@ -31,7 +31,7 @@ dsh plugin add dsh-deepai-connector
 - 推理前自动完成签到（`/theos` 拉 nonce 再回传）
 - 自建请求体与 SSE 解析，不依赖任何 LLM SDK
 - 上游以 `400 This request is not one DeepAI Code sends.` 拒绝异形请求体时报错后，按桌面端字段白名单重排一次
-- 模型目录由上游下发，本地只做缓存
+- 模型目录由上游下发，本地只做缓存；免费模型在选择器里带「· 免费」标记
 
 ## 已知限制
 

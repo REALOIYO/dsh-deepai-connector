@@ -1,6 +1,6 @@
 {
   "name": "dsh-deepai-connector",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": false,
   "type": "module",
   "description": "DeepAI Code 模型接入 DeepSeek Harness：浏览器 OAuth 登录直连上游，不需要安装 DeepAI Code 桌面客户端，也不需要额外的网关进程。",

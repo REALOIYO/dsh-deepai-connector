@@ -188,3 +188,25 @@ test('错误语义判定与 Go 的 HTTPError 方法集对齐', async () => {
   assert.equal(new UpstreamError(409, 'session_busy', 'x').capacityWaiting, true)
   assert.equal(new UpstreamError(409, 'other', 'x').capacityWaiting, false)
 })
+
+test('选择器显示名：免费模型带标记，付费不带', async () => {
+  // DSH 的模型选择器只渲染 name，没有徽章插槽，免费标记只能拼进名字
+  const { displayNameOf } = await import('../src/adapter/deepai.ts')
+
+  assert.equal(
+    displayNameOf({ id: 'glm-5.3-flash', name: 'GLM 5.3 Flash', theosPerRequest: '0' }),
+    'GLM 5.3 Flash · 免费',
+  )
+  // 付费模型不带标记
+  assert.equal(
+    displayNameOf({ id: 'claude-opus-5-5', name: 'Claude Opus 5.5', theosPerRequest: '15', premier: true }),
+    'Claude Opus 5.5',
+  )
+  // 缺 name 时退回 id
+  assert.equal(displayNameOf({ id: 'x', theosPerRequest: '0' }), 'x · 免费')
+  // 只有 premier 标记、没有 theosPerRequest → 付费，不加标记
+  assert.equal(displayNameOf({ id: 'p', name: 'P', premier: true }), 'P')
+  // 没有 premier 且没有 theosPerRequest → 视为免费
+  assert.equal(displayNameOf({ id: 'f', name: 'F' }), 'F · 免费')
+  assert.equal(displayNameOf(undefined), '')
+})
