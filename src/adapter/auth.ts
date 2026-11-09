@@ -21,7 +21,7 @@ import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { ORIGIN, PATH_EXCHANGE, PATH_SIGN_IN, modelUrl } from './protocol.ts'
+import { MODEL_BASE, ORIGIN, PATH_EXCHANGE, PATH_SIGN_IN, modelUrl } from './protocol.ts'
 
 /** 授权会话有效期。超时后回环服务自动关闭。 */
 const LOGIN_TTL_MS = 10 * 60 * 1000
@@ -187,6 +187,8 @@ function shutdown(server: Server | undefined): void {
  * 返回的 `url` 交给用户打开；`wait()` 一直等到回调完成或超时。
  */
 export function startSignIn(env = process.env): SignInSession {
+  // state 必须是 64 位十六进制：上游对短值直接回
+  // `400 Invalid desktop sign-in request.`，实测 8 位被拒、64 位通过。
   const state = randomBytes(32).toString('hex')
   let server: Server | undefined
   let settle: (account: StoredAccount) => void = () => {}
@@ -198,6 +200,10 @@ export function startSignIn(env = process.env): SignInSession {
     settle = resolve
     fail = reject
   })
+  // 调用方可能只发起授权、从不 `wait()`（例如用户直接关掉面板）。
+  // 「已取消 / 已超时」这类拒绝必须被吞掉，否则会冒成未处理的 Promise rejection，
+  // 在宿主里表现为一条刺眼的 unhandledRejection 日志。
+  done.catch(() => {})
 
   const finish = (fn: () => void): void => {
     if (finished) return
@@ -207,7 +213,11 @@ export function startSignIn(env = process.env): SignInSession {
     fn()
   }
 
-  const origin = (env.DEEPAI_API_ORIGIN ?? ORIGIN).replace(/\/+$/, '')
+  // 上游地址：`DEEPAI_API_ORIGIN` 可覆盖（自建反代 / 测试）
+  const origin = (env.DEEPAI_API_ORIGIN ?? ORIGIN).trim().replace(/\/+$/, '')
+  // `PATH_SIGN_IN` 是相对 `/deepai_code` 的路径，拼完整地址时必须带上该前缀
+  // （与 modelUrl 同一规则）。少了它得到 `api.deepai.org/desktop_auth/`，上游回 404。
+  const signInUrl = `${origin}${MODEL_BASE}${PATH_SIGN_IN}`
   const pending = new Promise<number>((resolve, reject) => {
     server = createServer((req, res) => {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1')
@@ -253,7 +263,7 @@ export function startSignIn(env = process.env): SignInSession {
   return {
     ready: () =>
       pending.then(port => {
-        const target = new URL(`${origin}${PATH_SIGN_IN}`)
+        const target = new URL(signInUrl)
         target.searchParams.set('state', state)
         target.searchParams.set('port', String(port))
         return target.toString()
