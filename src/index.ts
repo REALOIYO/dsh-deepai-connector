@@ -14,7 +14,7 @@
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { AccountStore, defaultDataDir, startSignIn, type SignInSession } from './adapter/auth.ts'
+import { AccountStore, defaultDataDir, startSignIn, type SignInSession, type StoredAccount } from './adapter/auth.ts'
 import { DeepAIClient } from './adapter/client.ts'
 import { DeepAIAdapter, PROVIDER_ID } from './adapter/deepai.ts'
 import { detectMachineFingerprint } from './adapter/machine.ts'
@@ -156,45 +156,74 @@ function start(
     return { ready }
   }
 
-  // 2. 后台加载账号 → 探指纹 → 探车道 → 拉目录
+  // 2. 后台初始化：指纹与账号解耦
+  //
+  // 指纹**与登录无关**：它读的是本机硬件，必须在启动时就落到 client 上。
+  // 早先把 setMachine 放在 `if (account === undefined) return` 之后，
+  // 结果是「启动时没登录 → 指纹永远补不上」，设置页一直显示未读取。
   void (async () => {
+    const fingerprint = await machineReady
+    client.setMachine(fingerprint)
+
     await store.load()
     const account = store.get()
     if (account === undefined) {
       logger.info('dsh-deepai-connector: 还没有登录，请在「设置 → DeepAI Code」完成授权')
       return
     }
+
     logger.info(`dsh-deepai-connector: 已加载账号 ${account.username !== '' ? account.username : '(无用户名)'}`)
     client.setApiKey(account.apiKey)
 
-    const fingerprint = await machineReady
-    // 客户端构造时指纹还空着，这里补上；指纹变了会触发 transport 重建。
-    client.setMachine(fingerprint)
-
-    try {
-      const lane = await client.probeLane()
-      logger.info(`dsh-deepai-connector: 车道版本 ${lane}`)
-    } catch {
-      logger.warn('dsh-deepai-connector: 车道探测失败，沿用默认值')
-    }
-
-    await adapter.refreshModels(true).catch(() => {})
-    logger.info(`dsh-deepai-connector: 模型目录 ${adapter.catalog.list().length} 项`)
+    await probeAndLoad(adapter, client, logger)
   })().catch((error: unknown) => {
     logger.error(`dsh-deepai-connector: 初始化失败：${error instanceof Error ? error.message : String(error)}`)
   })
 
   // 3. 设置页路由（可选：没有 connection 服务就跳过，不影响聊天）
-  installRoutes(ctx, cfg, store, client, adapter, logger)
+  installRoutes(ctx, cfg, store, client, adapter, logger, (account) => {
+    // 登录成功后补车道探测与目录刷新：启动时没登录，这两步都被跳过了。
+    client.setApiKey(account.apiKey)
+    void probeAndLoad(adapter, client, logger).catch((error: unknown) => {
+      logger.warn(
+        `dsh-deepai-connector: 登录后初始化失败：${error instanceof Error ? error.message : String(error)}`,
+      )
+    })
+  })
 
   return { ready }
 }
 
 /**
+ * 探车道 + 拉模型目录。
+ *
+ * 启动时（已登录）与登录成功后各调一次。车道探测失败不阻塞：沿用默认车道，
+ * 请求仍能发出去，只是上游抬档时会吃 426。
+ */
+async function probeAndLoad(
+  adapter: DeepAIAdapter,
+  client: DeepAIClient,
+  logger: PluginContext['logger'],
+): Promise<void> {
+  try {
+    const lane = await client.probeLane()
+    logger.info(`dsh-deepai-connector: 车道版本 ${lane}`)
+  } catch {
+    logger.warn('dsh-deepai-connector: 车道探测失败，沿用默认值')
+  }
+
+  await adapter.refreshModels(true).catch(() => {})
+  logger.info(`dsh-deepai-connector: 模型目录 ${adapter.catalog.list().length} 项`)
+}
+
+/**
  * 挂设置页用的 REST 路由。
  *
- * 用 `ctx.inject(['connection'])` 等连接注册表就绪。这套路由只做四件事：
+ * 用 `ctx.inject(['connection'])` 等连接注册表就绪。这套路由做四件事：
  * 发起授权、查状态、登出、刷新目录。**不需要重启就能生效**。
+ *
+ * `onSignedIn` 在授权成功、凭据落盘后被调一次：登录前跑不了的初始化
+ * （车道探测、模型目录）补在这里，否则用户登录完仍看不到模型。
  */
 function installRoutes(
   ctx: PluginContext,
@@ -203,6 +232,7 @@ function installRoutes(
   client: DeepAIClient,
   adapter: DeepAIAdapter,
   logger: PluginContext['logger'],
+  onSignedIn: (account: StoredAccount) => void,
 ): void {
   if (typeof ctx.inject !== 'function') return
 
@@ -298,7 +328,8 @@ function installRoutes(
               await store.save(account)
               client.setApiKey(account.apiKey)
               logger.info(`dsh-deepai-connector: 授权成功 ${account.username !== '' ? account.username : ''}`)
-              await adapter.refreshModels(true).catch(() => {})
+              // 登录前跑不了的那些初始化在这里补齐（车道、目录）
+              onSignedIn(account)
             })
             .catch((error: unknown) => {
               logger.warn(
