@@ -10,12 +10,13 @@
 
 ## 安装
 
+在 DSH 的「设置 → 插件」里按包名 `dsh-deepai-connector` 安装，或用插件管理器：
+
 ```sh
-cd ~/.dsh/profiles/desktop
-pnpm add dsh-deepai-connector
+dsh plugin add dsh-deepai-connector
 ```
 
-或在「设置 → 插件」里按包名安装。装完重启 DSH。
+装完重启 DSH。包内已含预构建产物，安装过程不执行构建。
 
 ## 首次使用
 
