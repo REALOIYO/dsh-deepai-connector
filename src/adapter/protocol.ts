@@ -39,6 +39,19 @@ export function origin(env: NodeJS.ProcessEnv = process.env): string {
 /** `/deepai_code` 前缀下的模型端点。 */
 export const MODEL_BASE = '/deepai_code'
 
+/**
+ * 车道探测的候选序列。
+ *
+ * 上游每抬一次车道就把旧值一律回 426（0.3.17 是 2，0.3.19 起是 4）。
+ * 按「新版优先、旧版兜底」试：命中即用，这样上游升级车道时插件不需要改代码。
+ *
+ * 与 `DeepAICode2API` 的 `LaneCandidates` 逐项一致 —— 少一个候选就在上游
+ * 抬到那一档时探测失败。
+ */
+export const LANE_CANDIDATES: readonly string[] = Object.freeze([
+  '4', '5', '6', '7', '8', '9', '10', '11', '12', '3', '2',
+])
+
 /** 车道版本。上游每抬一次就把旧值一律回 426。 */
 export const LANE_VERSION = '4'
 

@@ -141,11 +141,17 @@ export async function* toStreamChunks(
 
     const u = chatChunkUsage(object)
     if (u !== undefined) {
-      const normalized: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number } = {
+      const normalized: {
+        inputTokens: number
+        outputTokens: number
+        cacheReadTokens?: number
+        cacheWriteTokens?: number
+      } = {
         inputTokens: u.inputTokens,
         outputTokens: u.outputTokens,
       }
       if (u.cacheReadTokens !== undefined) normalized.cacheReadTokens = u.cacheReadTokens
+      if (u.cacheWriteTokens !== undefined) normalized.cacheWriteTokens = u.cacheWriteTokens
       usage = normalized
     }
 

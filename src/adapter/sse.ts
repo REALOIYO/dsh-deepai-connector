@@ -194,37 +194,83 @@ export function chatChunkDelta(chunk: Record<string, unknown>): { delta: ChatDel
   return { delta: out, finish }
 }
 
-/** 从 chunk 里取 usage。 */
-export function chatChunkUsage(chunk: Record<string, unknown>): {
+/** 一次 chat 的用量。 */
+export interface ChatUsage {
   inputTokens: number
   outputTokens: number
+  totalTokens?: number
   cacheReadTokens?: number
+  cacheWriteTokens?: number
+  /** 思维链占的 token，上游放在 `completion_tokens_details.reasoning_tokens`。 */
+  reasoningTokens?: number
+  /** 上游成本，`cost` 或 `cost_details.upstream_inference_cost`。 */
   cost?: number
-} | undefined {
+}
+
+/** 宽松取浮点。 */
+function floatOf(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string') {
+    const parsed = Number.parseFloat(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return 0
+}
+
+/**
+ * 从 chunk 里取 usage。
+ *
+ * 判据照 `DeepAICode2API` 的 `parseUsage`：`prompt_tokens`/`completion_tokens`
+ * 缺失时回落到 `input_tokens`/`output_tokens`（Responses 端点是后者），
+ * 思维链 token 从 `completion_tokens_details` 或 `output_tokens_details` 取，
+ * 成本优先 `cost`、其次 `cost_details.upstream_inference_cost`。
+ */
+export function chatChunkUsage(chunk: Record<string, unknown>): ChatUsage | undefined {
   const usage = chunk.usage
   if (usage === null || typeof usage !== 'object') return undefined
   const u = usage as Record<string, unknown>
 
-  const input = intOf(u.prompt_tokens)
-  const output = intOf(u.completion_tokens)
-  if (input === 0 && output === 0) return undefined
+  let input = intOf(u.prompt_tokens)
+  let output = intOf(u.completion_tokens)
+  if (input === 0) input = intOf(u.input_tokens)
+  if (output === 0) output = intOf(u.output_tokens)
 
-  const result: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cost?: number } = {
-    inputTokens: input,
-    outputTokens: output,
-  }
+  const total = intOf(u.total_tokens) || input + output
+  if (input === 0 && output === 0 && total === 0) return undefined
+
+  const result: ChatUsage = { inputTokens: input, outputTokens: output }
+  if (total > 0) result.totalTokens = total
 
   // 缓存命中量：上游有两条路放这个数
-  const details = u.prompt_tokens_details
-  if (details !== null && typeof details === 'object') {
-    const cached = intOf((details as Record<string, unknown>).cached_tokens)
+  const promptDetails = u.prompt_tokens_details
+  if (promptDetails !== null && typeof promptDetails === 'object') {
+    const cached = intOf((promptDetails as Record<string, unknown>).cached_tokens)
     if (cached > 0) result.cacheReadTokens = cached
   }
-  const costDetails = u.cost_details
-  if (costDetails !== null && typeof costDetails === 'object') {
-    const cost = (costDetails as Record<string, unknown>).upstream_inference_cost
-    if (typeof cost === 'number' && cost > 0) result.cost = cost
+
+  // 思维链 token
+  const completionDetails = u.completion_tokens_details
+  if (completionDetails !== null && typeof completionDetails === 'object') {
+    const reasoning = intOf((completionDetails as Record<string, unknown>).reasoning_tokens)
+    if (reasoning > 0) result.reasoningTokens = reasoning
   }
+  if (result.reasoningTokens === undefined) {
+    const outputDetails = u.output_tokens_details
+    if (outputDetails !== null && typeof outputDetails === 'object') {
+      const reasoning = intOf((outputDetails as Record<string, unknown>).reasoning_tokens)
+      if (reasoning > 0) result.reasoningTokens = reasoning
+    }
+  }
+
+  // 成本：顶层 cost 优先
+  let cost = floatOf(u.cost)
+  if (cost === 0) {
+    const costDetails = u.cost_details
+    if (costDetails !== null && typeof costDetails === 'object') {
+      cost = floatOf((costDetails as Record<string, unknown>).upstream_inference_cost)
+    }
+  }
+  if (cost > 0) result.cost = cost
 
   return result
 }

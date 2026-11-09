@@ -150,7 +150,7 @@ test('theos：先拉 nonce，下一次才回传 Check-In', async () => {
     res.writeHead(200, { 'content-type': 'application/json' })
     // 每次都给一个新挑战
     const seq = upstream.requests.filter(r => r.url.includes('/theos')).length
-    res.end(JSON.stringify({ balance: 200, granted: 200, check_in: { nonce: `nonce-${seq}`, seconds: 600 } }))
+    res.end(JSON.stringify({ balance: 200, granted: 200, check_in: { nonce: String(seq).padStart(32,"0"), seconds: 600 } }))
     void req
   })
 
@@ -168,7 +168,7 @@ test('theos：先拉 nonce，下一次才回传 Check-In', async () => {
     const calls = upstream.requests.filter(r => r.url.includes('/theos'))
     assert.equal(calls.length, 2)
     assert.equal(calls[0]?.headers['x-deepai-code-check-in'], undefined, '首次不该带 Check-In')
-    assert.equal(calls[1]?.headers['x-deepai-code-check-in'], 'nonce-1', '第二次必须回传上一次的 nonce')
+    assert.equal(calls[1]?.headers['x-deepai-code-check-in'], '1'.padStart(32,'0'), '第二次必须回传上一次的 nonce')
     // 心跳形态
     assert.match(String(calls[0]?.headers['x-deepai-code-beacon']), /^v=0\.3\.20;up=\d+;pi=[01]$/)
   } finally {
@@ -181,7 +181,7 @@ test('check_in_refused 后进入静默锁，不再反复打 theos', async () => 
   const upstream = await fakeUpstream((_req, res) => {
     theosCount += 1
     res.writeHead(403, { 'content-type': 'application/json' })
-    res.end(JSON.stringify({ error: { code: 'check_in_refused', message: 'try again tomorrow' }, check_in: { nonce: 'n', seconds: 600 } }))
+    res.end(JSON.stringify({ error: { code: 'check_in_refused', message: 'try again tomorrow' }, check_in: { nonce: 'a'.repeat(32), seconds: 600 } }))
   })
 
   try {

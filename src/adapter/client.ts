@@ -16,19 +16,24 @@ import { randomBytes } from 'node:crypto'
 import { chatBodyFallback, type GenerateOptions } from './body.ts'
 import {
   APP_VERSION,
+  CODE_AUTH_REQUIRED,
   CODE_CHECK_IN_REFUSED,
+  CODE_EMAIL_UNVERIFIED,
+  CODE_INVALID_API_KEY,
   CODE_LANE_UNSUPPORTED,
   CODE_MACHINE_REQUIRED,
   CODE_NETWORK_BOUND,
   CODE_SESSION_BUSY,
   CODE_SOCIAL_LOGIN,
   DESKTOP_INFERENCE_HEADERS,
+  HEADER_AFFINITY,
   HEADER_BEACON,
   HEADER_CHECK_IN,
   HEADER_INSTANCE,
   HEADER_KEY,
   HEADER_LANE,
   HEADER_MACHINE,
+  LANE_CANDIDATES,
   LANE_VERSION,
   PATH_CHAT,
   PATH_MODELS,
@@ -57,7 +62,7 @@ const CHECK_IN_TIMEOUT_MS = 10_000
 const CHECK_IN_REFUSED_LOCK_MS = 6 * 60 * 60 * 1000
 
 /** 非流式请求的整体预算。MaxRetries × Retry-After 理论上可挂 90s 以上。 */
-const NON_STREAM_BUDGET_MS = 120_000
+const NON_STREAM_BUDGET_MS = 90_000
 
 /** 上游模型目录里的一条。 */
 export interface UpstreamModel {
@@ -78,6 +83,20 @@ export interface CheckIn {
   seconds: number
 }
 
+/**
+ * 判定签到挑战是否有效。
+ *
+ * 与 `DeepAICode2API` 的 `CheckIn.Valid()` 同判据：`seconds > 0` 且 nonce 必须是
+ * **32 位小写十六进制**。只判「非空」会把上游下发的非法值也当成挑战，
+ * 于是回传一个注定不被认的 nonce，签到永远不生效。
+ */
+export function isValidCheckIn(value: { nonce: string; seconds: number } | undefined): boolean {
+  if (value === undefined) return false
+  if (!Number.isFinite(value.seconds) || value.seconds <= 0) return false
+  if (!/^[0-9a-f]{32}$/.test(value.nonce)) return false
+  return true
+}
+
 /** 上游 `/theos` 响应里用到的字段。 */
 export interface Allowance {
   balance?: number
@@ -94,6 +113,13 @@ interface CheckInState {
   /** 已回传给上游的 nonce。「拿到」与「回传」是两件事，只有后者算签到完成。 */
   ackedNonce: string
   refusedUntil: number
+  /**
+   * 最近一次推理转发的时间。
+   *
+   * 心跳里的 `pi` 字段由此得来：`pi=1` 表示最近一个 TTL 内发过推理请求。
+   * 桌面端在转发推理前记一次（`markRelay`），不是「签到过」的意思。
+   */
+  lastRelay: number
 }
 
 /**
@@ -125,6 +151,26 @@ export class UpstreamError extends Error {
   /** 缺机器指纹。 */
   get machineRequired(): boolean {
     return this.code === CODE_MACHINE_REQUIRED
+  }
+
+  /**
+   * 账号鉴权失败（401，或 401 语义的错误码）。
+   *
+   * 与普通 403 不同：登录态本身无效，换不换号都一样，应提示重新授权。
+   */
+  get authFailed(): boolean {
+    if (this.status === 401) return true
+    return this.code === CODE_AUTH_REQUIRED || this.code === CODE_INVALID_API_KEY || this.code === CODE_EMAIL_UNVERIFIED
+  }
+
+  /**
+   * 邮箱未验证。
+   *
+   * 上游因邮箱未验证拒绝时，登录态无效；标记后应跳过，而不是当可重试失败
+   * 反复打。
+   */
+  get emailUnverified(): boolean {
+    return this.code === CODE_EMAIL_UNVERIFIED
   }
 
   /** 车道版本不被接受。 */
@@ -198,6 +244,23 @@ export function retryAfterSeconds(header: string | null, fallback = 3): number {
   return Math.min(30, Math.max(1, parsed))
 }
 
+/** 会话标识的合法字符集，与桌面端一致：只透传安全字符集。 */
+const AFFINITY_PATTERN = /^[A-Za-z0-9._:-]{1,256}$/
+
+/**
+ * 解析会话粘性标识。
+ *
+ * 上游用 `X-Session-Affinity` 做调度粘性（同一会话尽量落到同一后端）。
+ * 来源是请求体里的 `prompt_cache_key`；格式不合法的值**不发**该头，
+ * 发一个畸形值比不发更糟。
+ */
+export function affinityFor(body: Record<string, unknown>): string {
+  const raw = body.prompt_cache_key
+  if (typeof raw !== 'string') return ''
+  const value = raw.trim()
+  return AFFINITY_PATTERN.test(value) ? value : ''
+}
+
 /** 一次 chat 请求的结果。 */
 export interface ChatResult {
   /** 上游的 SSE 流。 */
@@ -261,7 +324,7 @@ export class DeepAIClient {
   #state(key: string): CheckInState {
     let state = this.#checkIns.get(key)
     if (state === undefined) {
-      state = { challenge: undefined, notedAt: 0, attemptedAt: 0, ackedNonce: '', refusedUntil: 0 }
+      state = { challenge: undefined, notedAt: 0, attemptedAt: 0, ackedNonce: '', refusedUntil: 0, lastRelay: 0 }
       this.#checkIns.set(key, state)
     }
     return state
@@ -345,7 +408,7 @@ export class DeepAIClient {
    * 命中即落盘，这样上游升级车道时插件不需要改代码。
    */
   async probeLane(signal?: AbortSignal): Promise<string> {
-    const candidates = ['4', '5', '6', '7', '3', '2']
+    const candidates = LANE_CANDIDATES
     const previous = this.#lane
     for (const lane of candidates) {
       this.#lane = lane
@@ -374,14 +437,29 @@ export class DeepAIClient {
   /** 给 `/theos` 加签到头与心跳。 */
   #checkInHeaders(state: CheckInState): Record<string, string> {
     const headers: Record<string, string> = {}
-    if (state.challenge !== undefined && state.challenge.nonce !== state.ackedNonce) {
-      headers[HEADER_CHECK_IN] = state.challenge.nonce
+    const challenge = state.challenge
+
+    // TTL 取挑战的 seconds，缺省 600（与 Go 实现一致）
+    const ttl = challenge !== undefined && challenge.seconds > 0 ? challenge.seconds : 600
+
+    if (challenge !== undefined && challenge.nonce !== '') {
+      headers[HEADER_CHECK_IN] = challenge.nonce
     }
+
+    // `pi` 的语义是「最近一个 TTL 内发过推理请求」，由 markRelay 维护。
+    // 不是「签到过没有」—— 那会让心跳与桌面端不一致。
+    const relayed = state.lastRelay > 0 && Date.now() - state.lastRelay < ttl * 1000
     const up = Math.max(0, Math.floor((Date.now() - this.#startedAt) / 1000))
     // 形态 `v=<版本>;up=<秒>;pi=<0|1>`。`focus` 只在焦点状态已知时才加，
-    // 插件没有窗口焦点，因此省略。
-    headers[HEADER_BEACON] = `v=${APP_VERSION};up=${up};pi=${state.attemptedAt > 0 ? 1 : 0}`
+    // 插件没有窗口焦点，因此省略（与桌面端未知焦点时的行为一致）。
+    headers[HEADER_BEACON] = `v=${APP_VERSION};up=${up};pi=${relayed ? 1 : 0}`
     return headers
+  }
+
+  /** 记一次推理转发时间，供心跳的 `pi` 字段使用。 */
+  markRelay(): void {
+    if (this.#apiKey === '') return
+    this.#state(this.#apiKey).lastRelay = Date.now()
   }
 
   /** 从响应体里取签到挑战。成功与 403 拒绝都会带。 */
@@ -397,7 +475,9 @@ export class DeepAIClient {
     const candidate = raw as { nonce?: unknown; seconds?: unknown }
     const nonce = typeof candidate.nonce === 'string' ? candidate.nonce.trim() : ''
     const seconds = typeof candidate.seconds === 'number' ? candidate.seconds : 0
-    if (nonce === '' || seconds <= 0) return
+
+    // 用与上游一致的判据：nonce 必须是 32 位小写十六进制。
+    if (!isValidCheckIn({ nonce, seconds })) return
 
     const state = this.#state(key)
     state.challenge = { nonce, seconds }
@@ -469,8 +549,13 @@ export class DeepAIClient {
     if (state.refusedUntil > 0 && now < state.refusedUntil) return
 
     const challenge = state.challenge
-    const needAck = challenge !== undefined && challenge.nonce !== state.ackedNonce
-    if (challenge !== undefined && !needAck && now - state.notedAt < (challenge.seconds * 1000) / 2) return
+    // 只有**有效**挑战才算「有挑战」：非法 nonce 不该挡住补签到
+    const hasChallenge = isValidCheckIn(challenge)
+    const needAck = hasChallenge && challenge.nonce !== state.ackedNonce
+
+    // 有挑战且已回传，且还在半衰期内 → 什么都不用做
+    if (hasChallenge && !needAck && now - state.notedAt < (challenge.seconds * 1000) / 2) return
+    // 两次尝试之间留间隔
     if (state.attemptedAt > 0 && now - state.attemptedAt < CHECK_IN_MIN_INTERVAL_MS) return
 
     const controller = new AbortController()
@@ -490,6 +575,9 @@ export class DeepAIClient {
    * 形状兜底照 `openModel`：仍先按正常字段发；只有命中
    * `400 This request is not one DeepAI Code sends.` 时，才按桌面端字段白名单
    * 重排一次并补齐 system 消息。
+   *
+   * `affinity` 是会话粘性标识（上游据此做调度粘性），取自 `prompt_cache_key`；
+   * 格式必须落在 `^[A-Za-z0-9._:-]{1,256}$` 内，非法值不发该请求头。
    */
   async openChat(
     options: GenerateOptions,
@@ -497,7 +585,8 @@ export class DeepAIClient {
     body: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<ChatResult> {
-    const first = await this.#postChat(body, signal)
+    const affinity = affinityFor(body)
+    const first = await this.#postChat(body, signal, affinity)
     if (first.ok) {
       return this.#toChatResult(first, signal)
     }
@@ -508,7 +597,7 @@ export class DeepAIClient {
     if (error.bodyRejected) {
       const fallback = chatBodyFallback(body, options.system)
       if (fallback !== undefined) {
-        const retry = await this.#postChat(fallback, signal)
+        const retry = await this.#postChat(fallback, signal, affinity)
         if (retry.ok) return this.#toChatResult(retry, signal)
         throw await this.#toError(retry, '形状回退后请求 chat')
       }
@@ -518,10 +607,14 @@ export class DeepAIClient {
   }
 
   /** 发一次 POST，不解析响应体。 */
-  async #postChat(body: Record<string, unknown>, signal?: AbortSignal): Promise<Response> {
+  async #postChat(body: Record<string, unknown>, signal?: AbortSignal, affinity?: string): Promise<Response> {
+    const headers = this.#commonHeaders()
+    if (affinity !== undefined && affinity !== '') headers[HEADER_AFFINITY] = affinity
+    // 桌面端在转发推理前记一次 lastRelayAt，心跳里的 pi 字段由此得来。
+    this.markRelay()
     return fetch(modelUrl(PATH_CHAT), {
       method: 'POST',
-      headers: this.#commonHeaders(),
+      headers,
       body: JSON.stringify(body),
       ...(signal !== undefined ? { signal } : {}),
       // 上游会 302 到登录页，跟随会把鉴权失败伪装成 200

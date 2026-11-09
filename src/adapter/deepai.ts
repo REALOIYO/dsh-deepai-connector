@@ -214,6 +214,12 @@ export class DeepAIAdapter {
           '换号或重试都无效，请在「设置 → DeepAI Code」用 Google/Apple 重新授权。',
       )
     }
+    if (error.emailUnverified) {
+      return new Error('deepai: 账号邮箱未验证，上游拒绝了这次请求。请到上游验证邮箱后重新授权。')
+    }
+    if (error.authFailed) {
+      return new Error('deepai: 登录状态已失效，请到「设置 → DeepAI Code」重新授权。')
+    }
     if (error.machineRequired) {
       return new Error(
         'deepai: 上游要求机器指纹，但本地没读到。可设置环境变量 DEEPAI_MACHINE_ID=<原始机器 UUID> 后重启 DSH。',
