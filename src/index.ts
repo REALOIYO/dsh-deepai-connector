@@ -372,5 +372,5 @@ export { DeepAIAdapter, PROVIDER_ID } from './adapter/deepai.ts'
 export { DeepAIClient } from './adapter/client.ts'
 export { AccountStore, startSignIn } from './adapter/auth.ts'
 export { detectMachineFingerprint, machineFingerprint } from './adapter/machine.ts'
-export { toPiContext } from './adapter/context.ts'
+
 export { toStreamChunks } from './adapter/stream.ts'

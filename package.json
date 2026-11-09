@@ -40,7 +40,6 @@
   "peerDependencies": {
     "@deepseek-ai/dsh-llm": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
     "@deepseek-ai/cordis": "^4.0.2",
-    "@earendil-works/pi-ai": "^0.82.1",
     "react": ">=18",
     "@deepseek-ai/dsh-client-ui-renderer": "*",
     "@deepseek-ai/dsh-client-locale": "*",
@@ -51,9 +50,6 @@
       "optional": true
     },
     "@deepseek-ai/cordis": {
-      "optional": true
-    },
-    "@earendil-works/pi-ai": {
       "optional": true
     },
     "react": {

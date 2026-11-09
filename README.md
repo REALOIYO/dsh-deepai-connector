@@ -9,7 +9,7 @@
 - 浏览器 OAuth 拿 Key（RFC 8252 本机回调，与桌面端同款流程），没有桌面端也能登录；
 - 复刻上游要求的请求头形状：`Api-Key` 鉴权、车道版本、进程实例号、机器指纹、`User-Agent: node`；
 - 推理前自动完成签到（`/theos` 拉 nonce 再回传），这是上游判定「真客户端」的关键；
-- 用 pi-ai 的 `openai-completions` 发请求 —— 桌面端本身就是 pi 驱动的，请求体形状天然对齐；
+- **自己拼请求体、自己读 SSE**，不借任何 OpenAI SDK：上游会以 `400 This request is not one DeepAI Code sends.` 拒绝异形请求体，命中后按桌面端字段白名单重排一次；
 - 模型目录完全由上游下发，插件只做缓存。
 
 ## 装法
@@ -55,7 +55,7 @@ node --test "test/*.test.ts"        # 33 个用例
 
 插件不做构建产物：`main` 指向 `src/index.ts`，由 Node 的 type stripping 处理（需要 Node 22.18+ / 24）。这样宿主里跑的就是仓库里那份源码，排障不用对照编译结果。
 
-依赖 `@earendil-works/pi-ai` 是 peer，由 DSH profile 提供（`nodeLinker: hoisted` 会把它提到顶层）。本地开发时若解析不到，把 profile 里对应包软链到本仓库 `node_modules/`。
+插件**运行时零依赖**：不引任何 LLM SDK，协议层全部自己实现（`src/adapter/` 下的 9 个模块）。
 
 ## 致谢
 

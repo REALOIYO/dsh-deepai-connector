@@ -270,3 +270,145 @@ test('上游错误被翻译成带 code 的 UpstreamError', async () => {
     await upstream.close()
   }
 })
+
+/** 构造一个最小请求选项。 */
+function chatOptions(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    provider: 'deepai',
+    model: 'glm-5.3-flash',
+    messages: [{ role: 'user', content: [{ type: 'text', text: '你好' }] }],
+    ...overrides,
+  }
+}
+
+test('openChat：发出的 body 带 store:false 与 stream:true', async () => {
+  const upstream = await fakeUpstream((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.end('data: [DONE]\n\n')
+  })
+
+  try {
+    const client = new DeepAIClient({ machine: 'a'.repeat(64) })
+    client.setApiKey('sk-abc')
+    await withUpstream(upstream.base, async () => {
+      const { buildChatBody } = await import('../src/adapter/body.ts')
+      const options = chatOptions() as Parameters<typeof buildChatBody>[0]
+      const body = buildChatBody(options, 'glm-5.3-flash')
+      const result = await client.openChat(options, 'glm-5.3-flash', body)
+      await result.body.cancel()
+    })
+
+    const sent = upstream.requests[0]
+    assert.ok(sent)
+    const payload = JSON.parse(sent.body) as Record<string, unknown>
+    assert.equal(payload.store, false, 'store 必须发，漏了会被上游拒')
+    assert.equal(payload.stream, true)
+    assert.equal(payload.model, 'glm-5.3-flash')
+    assert.equal(sent.headers['api-key'], 'sk-abc')
+    assert.equal(sent.headers['user-agent'], 'node')
+  } finally {
+    await upstream.close()
+  }
+})
+
+test('openChat：命中 400 形状拒绝后自动重排重试一次', async () => {
+  let attempts = 0
+  const bodies: string[] = []
+  const upstream = await fakeUpstream((_req, res) => {
+    attempts += 1
+    bodies.push(_req.body)
+    if (attempts === 1) {
+      res.writeHead(400, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: { code: 'invalid_request_error', message: 'This request is not one DeepAI Code sends.' } }))
+      return
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.end('data: [DONE]\n\n')
+  })
+
+  try {
+    const client = new DeepAIClient()
+    client.setApiKey('sk-abc')
+    await withUpstream(upstream.base, async () => {
+      const { buildChatBody } = await import('../src/adapter/body.ts')
+      const options = chatOptions() as Parameters<typeof buildChatBody>[0]
+      // 故意塞一个白名单外字段，模拟「形状不对」
+      const body = { ...buildChatBody(options, 'glm-5.3-flash'), user: 'bad-field' }
+      const result = await client.openChat(options, 'glm-5.3-flash', body)
+      await result.body.cancel()
+    })
+
+    assert.equal(attempts, 2, '应当重试一次')
+    const retried = JSON.parse(bodies[1] ?? '{}') as Record<string, unknown>
+    assert.equal('user' in retried, false, '重排后应丢掉白名单外字段')
+    assert.equal(retried.store, false, 're 排后仍要有 store')
+  } finally {
+    await upstream.close()
+  }
+})
+
+test('openChat：非形状类 400 不重试', async () => {
+  let attempts = 0
+  const upstream = await fakeUpstream((_req, res) => {
+    attempts += 1
+    res.writeHead(400, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ error: { code: 'invalid_request_error', message: 'bad model' } }))
+  })
+
+  try {
+    const client = new DeepAIClient()
+    client.setApiKey('sk-abc')
+    const error = await withUpstream(upstream.base, async () => {
+      const { buildChatBody } = await import('../src/adapter/body.ts')
+      const options = chatOptions() as Parameters<typeof buildChatBody>[0]
+      const body = buildChatBody(options, 'm')
+      return client.openChat(options, 'm', body).then(
+        () => null,
+        (e: unknown) => e as Error,
+      )
+    })
+
+    assert.ok(error)
+    assert.equal(attempts, 1, '非形状类 400 不该重试')
+  } finally {
+    await upstream.close()
+  }
+})
+
+test('completeChat：把 SSE 拼成完整消息', async () => {
+  const upstream = await fakeUpstream((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.end(
+      [
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { reasoning: '想一下' } }] })}`,
+        '',
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: '你好' } }] })}`,
+        '',
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: '世界' }, finish_reason: 'stop' }] })}`,
+        '',
+        `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 10, completion_tokens: 5 } })}`,
+        '',
+        'data: [DONE]',
+        '',
+        '',
+      ].join('\n'),
+    )
+  })
+
+  try {
+    const client = new DeepAIClient()
+    client.setApiKey('sk-abc')
+    const result = await withUpstream(upstream.base, async () => {
+      const { buildChatBody } = await import('../src/adapter/body.ts')
+      const options = chatOptions() as Parameters<typeof buildChatBody>[0]
+      return client.completeChat(options, 'm', buildChatBody(options, 'm'))
+    })
+
+    assert.equal(result.text, '你好世界')
+    assert.equal(result.reasoning, '想一下')
+    assert.equal(result.finish, 'stop')
+    assert.equal(result.usage?.inputTokens, 10)
+  } finally {
+    await upstream.close()
+  }
+})

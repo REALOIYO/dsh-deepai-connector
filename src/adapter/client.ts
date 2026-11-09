@@ -1,16 +1,19 @@
 /**
- * DeepAI 上游客户端：请求头组装、签到状态机、错误语义。
+ * DeepAI 上游客户端：请求头组装、签到状态机、chat 请求、错误语义。
  *
- * 这里做的事只有三件，别的都交给 pi-ai：
- *   1. 把请求头的形状做对（UA 必须是 `node`，带车道号、实例号、机器指纹）；
- *   2. 推理前确保签到完成 —— 上游拿这个判定「是不是真客户端」；
- *   3. 把上游的错误码翻译成可判定的语义，交给适配器决定要不要重试。
+ * 反代实现照 `2951461586/DeepAICode2API`（`internal/deepai/client.go`、
+ * `internal/deepai/checkin.go`、`internal/server/common.go`）：
+ * **自己拼请求、自己读 SSE、自己分类错误**，不借任何 SDK。
+ *
+ * 上游本身是 OpenAI 兼容接口，因此这里做的是「带签到与形状兜底的透明转发」：
+ * 改写模型名、注入 DeepAI 鉴权头、归一化思维链字段。
  *
  * @module src/adapter/client.ts
  */
 
 import { randomBytes } from 'node:crypto'
 
+import { chatBodyFallback, type GenerateOptions } from './body.ts'
 import {
   APP_VERSION,
   CODE_CHECK_IN_REFUSED,
@@ -27,7 +30,9 @@ import {
   HEADER_LANE,
   HEADER_MACHINE,
   LANE_VERSION,
+  PATH_CHAT,
   PATH_MODELS,
+  PATH_RESPONSES,
   PATH_THEOS,
   modelUrl,
 } from './protocol.ts'
@@ -35,7 +40,7 @@ import {
 /**
  * 两次签到尝试之间的最小间隔。
  *
- * 桌面端在拿到 `check_in` 之前不主动签到（它靠账号状态刷新触发）；
+ * 桌面端拿到 `check_in` 之前不主动签到（它靠账号状态刷新触发）；
  * 本插件没有独立的状态轮询，给个下限避免每次热路径请求都撞一次 403。
  */
 const CHECK_IN_MIN_INTERVAL_MS = 30_000
@@ -46,11 +51,13 @@ const CHECK_IN_TIMEOUT_MS = 10_000
 /**
  * 命中 `check_in_refused` 后的静默锁时长。
  *
- * 上游当天「重启签到」次数用尽后 403 里**仍然会下发新的 nonce**，
- * 不停手就会变成一个自己制造的签到风暴。锁 6h 与客户端的日额度节奏一致，
- * 到期允许再试一次。
+ * 上游当天「重启签到」次数用尽后 403 里**仍然会下发新 nonce**，不停手就成了
+ * 自己制造的签到风暴。锁 6h 与客户端日额度节奏一致，到期允许再试一次。
  */
 const CHECK_IN_REFUSED_LOCK_MS = 6 * 60 * 60 * 1000
+
+/** 非流式请求的整体预算。MaxRetries × Retry-After 理论上可挂 90s 以上。 */
+const NON_STREAM_BUDGET_MS = 120_000
 
 /** 上游模型目录里的一条。 */
 export interface UpstreamModel {
@@ -65,6 +72,12 @@ export interface UpstreamModel {
   theosPerRequest?: string
 }
 
+/** 签到挑战。 */
+export interface CheckIn {
+  nonce: string
+  seconds: number
+}
+
 /** 上游 `/theos` 响应里用到的字段。 */
 export interface Allowance {
   balance?: number
@@ -73,13 +86,7 @@ export interface Allowance {
   checkIn?: CheckIn
 }
 
-/** 签到挑战。 */
-export interface CheckIn {
-  nonce: string
-  seconds: number
-}
-
-/** 上游进程级状态：实例号、机器指纹、按 key 隔离的签到状态。 */
+/** 进程级状态：实例号、机器指纹、按 key 隔离的签到状态。 */
 interface CheckInState {
   challenge: CheckIn | undefined
   notedAt: number
@@ -98,16 +105,19 @@ export class UpstreamError extends Error {
   readonly status: number
   readonly code: string
   readonly body: string
+  /** 上游 `Retry-After`，秒。 */
+  readonly retryAfter?: number
 
-  constructor(status: number, code: string, message: string, body = '') {
+  constructor(status: number, code: string, message: string, body = '', retryAfter?: number) {
     super(message)
     this.name = 'UpstreamError'
     this.status = status
     this.code = code
     this.body = body
+    if (retryAfter !== undefined) this.retryAfter = retryAfter
   }
 
-  /** 账号级策略拦截：换号、重试都无解，只能换登录方式。 */
+  /** 账号级策略拦截：换号、重试都无解。 */
   get socialLoginRequired(): boolean {
     return this.code === CODE_SOCIAL_LOGIN
   }
@@ -117,7 +127,7 @@ export class UpstreamError extends Error {
     return this.code === CODE_MACHINE_REQUIRED
   }
 
-  /** 车道版本不被接受，需要换车道号。 */
+  /** 车道版本不被接受。 */
   get laneUnsupported(): boolean {
     return this.status === 426 || this.code === CODE_LANE_UNSUPPORTED
   }
@@ -132,9 +142,28 @@ export class UpstreamError extends Error {
     return this.code === CODE_CHECK_IN_REFUSED
   }
 
-  /** 网络级免费额度领完（同一出口 IP 共享当日池子）。 */
+  /** 网络级免费额度领完。 */
   get networkBound(): boolean {
     return this.code === CODE_NETWORK_BOUND
+  }
+
+  /**
+   * 请求体形状被拒。
+   *
+   * 上游对新车道加了请求体校验，典型响应是 400 + `invalid_request_error`，
+   * message 固定为 `This request is not one DeepAI Code sends.`。
+   * 命中后按桌面端字段白名单重排一次，这是唯一值得纠正的 400。
+   */
+  get bodyRejected(): boolean {
+    if (this.status !== 400) return false
+    return this.body.toLowerCase().includes('not one deepai code sends')
+  }
+
+  /** 该不该重试。策略类错误码是终态，换谁问都一样。 */
+  get retryable(): boolean {
+    if (this.socialLoginRequired || this.machineRequired || this.laneUnsupported) return false
+    if (this.status === 400 || this.status === 404 || this.status === 422) return false
+    return [401, 403, 409, 429, 500, 502, 503, 504].includes(this.status) || this.status >= 500
   }
 }
 
@@ -169,11 +198,20 @@ export function retryAfterSeconds(header: string | null, fallback = 3): number {
   return Math.min(30, Math.max(1, parsed))
 }
 
+/** 一次 chat 请求的结果。 */
+export interface ChatResult {
+  /** 上游的 SSE 流。 */
+  body: ReadableStream<Uint8Array>
+  /** 上游状态码。 */
+  status: number
+  /** 中止句柄。 */
+  abort: () => void
+}
+
 /**
  * 上游客户端。
  *
- * 一个实例服务一个已授权账号；实例号进程级一次，签到状态按 API Key 隔离
- * （这里只有一个账号，但保留按 key 分桶的形状以便将来支持多号）。
+ * 一个实例服务一个已授权账号；实例号进程级一次，签到状态按 API Key 隔离。
  */
 export class DeepAIClient {
   readonly #instance: string
@@ -181,7 +219,7 @@ export class DeepAIClient {
   #machine: string
   #apiKey = ''
   #lane: string
-  #checkIns = new Map<string, CheckInState>()
+  readonly #checkIns = new Map<string, CheckInState>()
 
   constructor(options: { machine?: string; lane?: string } = {}) {
     this.#instance = randomBytes(16).toString('hex')
@@ -204,12 +242,7 @@ export class DeepAIClient {
     return this.#machine
   }
 
-  /**
-   * 补设机器指纹。
-   *
-   * 指纹是异步探到的（Windows 上要起 PowerShell），客户端构造时通常还空着；
-   * 探到后立刻补上，否则上游会以 `machine_required` 拒绝推理。
-   */
+  /** 补设机器指纹（异步探到后调用）。 */
   setMachine(fingerprint: string): void {
     this.#machine = fingerprint.trim()
   }
@@ -237,8 +270,9 @@ export class DeepAIClient {
   /**
    * 组装公共请求头。
    *
-   * `desktopInferenceHeaders` 必须原样发出：这几行是上游区分真假客户端的
-   * 主要判据。不要「顺手加上更完整的头」。
+   * `DESKTOP_INFERENCE_HEADERS` 必须原样发出：这几行是上游区分真假客户端的
+   * 主要判据。不要「顺手加上更完整的头」——带 `sec-ch-ua` 或 Chrome UA
+   * 反而会被识别成非客户端。
    */
   #commonHeaders(): Record<string, string> {
     const headers: Record<string, string> = {
@@ -252,21 +286,6 @@ export class DeepAIClient {
     return headers
   }
 
-  /** 发一次请求，非 2xx 抛 {@link UpstreamError}。 */
-  async #request(path: string, init: { method?: string; body?: string; signal?: AbortSignal } = {}): Promise<Response> {
-    const headers = this.#commonHeaders()
-    // 签到头只在 /theos 上带
-    const response = await fetch(modelUrl(path), {
-      method: init.method ?? 'GET',
-      headers,
-      ...(init.body !== undefined ? { body: init.body } : {}),
-      ...(init.signal !== undefined ? { signal: init.signal } : {}),
-      // 上游会把无效 Key 302 到登录页，跟随只会把鉴权失败伪装成 200。
-      redirect: 'manual',
-    })
-    return response
-  }
-
   /** 把非 2xx 响应转成 {@link UpstreamError}。 */
   async #toError(response: Response, op: string): Promise<UpstreamError> {
     const body = await response.text().catch(() => '')
@@ -277,16 +296,23 @@ export class DeepAIClient {
       code,
       `${op}失败（HTTP ${response.status}）${message !== '' ? `：${message}` : ''}`,
       body,
+      retryAfterSeconds(response.headers.get('retry-after')),
     )
   }
 
   /**
    * 拉模型目录。
    *
-   * `/models` 是免鉴权的，因此也是探测车道版本最便宜的方式。
+   * `/models` 免鉴权，因此也是探测车道最便宜的方式。
    */
   async listModels(signal?: AbortSignal): Promise<UpstreamModel[]> {
-    const response = await this.#request(PATH_MODELS, { ...(signal !== undefined ? { signal } : {}) })
+    const response = await fetch(modelUrl(PATH_MODELS), {
+      method: 'GET',
+      headers: this.#commonHeaders(),
+      ...(signal !== undefined ? { signal } : {}),
+      // 无效 Key 会 302 到登录页，跟随只会把鉴权失败伪装成 200。
+      redirect: 'manual',
+    })
     if (!response.ok) throw await this.#toError(response, '拉取模型目录')
 
     const payload = (await response.json()) as { data?: unknown; models?: unknown }
@@ -320,11 +346,16 @@ export class DeepAIClient {
    */
   async probeLane(signal?: AbortSignal): Promise<string> {
     const candidates = ['4', '5', '6', '7', '3', '2']
+    const previous = this.#lane
     for (const lane of candidates) {
-      const previous = this.#lane
       this.#lane = lane
       try {
-        const response = await this.#request(PATH_MODELS, { ...(signal !== undefined ? { signal } : {}) })
+        const response = await fetch(modelUrl(PATH_MODELS), {
+          method: 'GET',
+          headers: this.#commonHeaders(),
+          ...(signal !== undefined ? { signal } : {}),
+          redirect: 'manual',
+        })
         if (response.ok) return lane
         // 426 说明这个车道不对，继续试下一个；其它错误说明问题不在车道。
         if (response.status !== 426) {
@@ -348,7 +379,7 @@ export class DeepAIClient {
     }
     const up = Math.max(0, Math.floor((Date.now() - this.#startedAt) / 1000))
     // 形态 `v=<版本>;up=<秒>;pi=<0|1>`。`focus` 只在焦点状态已知时才加，
-    // 插件没有窗口焦点，因此省略（与桌面端未知焦点时的行为一致）。
+    // 插件没有窗口焦点，因此省略。
     headers[HEADER_BEACON] = `v=${APP_VERSION};up=${up};pi=${state.attemptedAt > 0 ? 1 : 0}`
     return headers
   }
@@ -400,12 +431,13 @@ export class DeepAIClient {
         errorCodeOf(body),
         `查询 Theos 失败（HTTP ${response.status}）：${errorMessageOf(body)}`,
         body,
+        retryAfterSeconds(response.headers.get('retry-after')),
       )
       if (error.checkInRefused) state.refusedUntil = Date.now() + CHECK_IN_REFUSED_LOCK_MS
       throw error
     }
 
-    let payload: { balance?: number; granted?: number; refresh_at?: string; refreshAt?: string; check_in?: unknown }
+    let payload: { balance?: number; granted?: number; refresh_at?: string; refreshAt?: string }
     try {
       payload = JSON.parse(body) as typeof payload
     } catch {
@@ -426,9 +458,7 @@ export class DeepAIClient {
    * 推理前确保签到完成。
    *
    * 这是「请求被不被接受」的关键：实测只拉 nonce 不回传 = 0/14 对齐，
-   * 完整签到 = 14/14。判定按 (账号, 机器指纹) 记忆，换指纹等于冷启动。
-   *
-   * 失败一律不阻塞推理 —— 签到只影响落到真分支还是替身分支。
+   * 完整签到 = 14/14。失败一律不阻塞推理 —— 签到只影响落到真分支还是替身。
    */
   async ensureCheckIn(signal?: AbortSignal): Promise<void> {
     if (this.#apiKey === '') return
@@ -440,9 +470,7 @@ export class DeepAIClient {
 
     const challenge = state.challenge
     const needAck = challenge !== undefined && challenge.nonce !== state.ackedNonce
-    // 有挑战且已回传，且还在半衰期内 → 什么都不用做
     if (challenge !== undefined && !needAck && now - state.notedAt < (challenge.seconds * 1000) / 2) return
-    // 两次尝试之间留间隔
     if (state.attemptedAt > 0 && now - state.attemptedAt < CHECK_IN_MIN_INTERVAL_MS) return
 
     const controller = new AbortController()
@@ -451,6 +479,127 @@ export class DeepAIClient {
       await this.theos(signal ?? controller.signal)
     } catch {
       // 签到失败不影响推理
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /**
+   * 发一次 chat 请求，返回上游 SSE 流。
+   *
+   * 形状兜底照 `openModel`：仍先按正常字段发；只有命中
+   * `400 This request is not one DeepAI Code sends.` 时，才按桌面端字段白名单
+   * 重排一次并补齐 system 消息。
+   */
+  async openChat(
+    options: GenerateOptions,
+    model: string,
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<ChatResult> {
+    const first = await this.#postChat(body, signal)
+    if (first.ok) {
+      return this.#toChatResult(first, signal)
+    }
+
+    const error = await this.#toError(first, '请求 chat')
+
+    // 唯一的可纠正 400：请求体不是桌面端形状
+    if (error.bodyRejected) {
+      const fallback = chatBodyFallback(body, options.system)
+      if (fallback !== undefined) {
+        const retry = await this.#postChat(fallback, signal)
+        if (retry.ok) return this.#toChatResult(retry, signal)
+        throw await this.#toError(retry, '形状回退后请求 chat')
+      }
+    }
+
+    throw error
+  }
+
+  /** 发一次 POST，不解析响应体。 */
+  async #postChat(body: Record<string, unknown>, signal?: AbortSignal): Promise<Response> {
+    return fetch(modelUrl(PATH_CHAT), {
+      method: 'POST',
+      headers: this.#commonHeaders(),
+      body: JSON.stringify(body),
+      ...(signal !== undefined ? { signal } : {}),
+      // 上游会 302 到登录页，跟随会把鉴权失败伪装成 200
+      redirect: 'manual',
+    })
+  }
+
+  /** 把成功的响应转成 {@link ChatResult}。 */
+  #toChatResult(response: Response, signal?: AbortSignal): ChatResult {
+    if (response.body === null) throw new Error('上游没有返回响应体')
+    return {
+      body: response.body,
+      status: response.status,
+      abort: () => {
+        try {
+          void response.body?.cancel()
+        } catch {
+          // 已经关了
+        }
+        void signal
+      },
+    }
+  }
+
+  /**
+   * 非流式 chat 请求。
+   *
+   * 有些客户端（以及 DSH 的部分内部调用）要完整消息而不是流。
+   * 这里也走 SSE 端点，把帧拼起来，因为上游在缺省 `stream` 时本来就返回 SSE。
+   */
+  async completeChat(
+    options: GenerateOptions,
+    model: string,
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<{ text: string; reasoning: string; toolCalls: Array<{ id: string; name: string; arguments: string }>; usage?: Record<string, number>; finish: string }> {
+    const { forEachSseFrame, chatChunkDelta, chatChunkUsage } = await import('./sse.ts')
+
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), NON_STREAM_BUDGET_MS)
+    const merged = signal ?? controller.signal
+
+    try {
+      const result = await this.openChat(options, model, { ...body, stream: true }, merged)
+      let text = ''
+      let reasoning = ''
+      let finish = ''
+      let usage: Record<string, number> | undefined
+      const toolCalls = new Map<number, { id: string; name: string; args: string }>()
+
+      await forEachSseFrame(result.body, frame => {
+        if (frame.object === undefined) return true
+        const { delta, finish: f } = chatChunkDelta(frame.object)
+        if (f !== '') finish = f
+        text += delta.content
+        reasoning += delta.reasoning
+        for (const tc of delta.toolCalls) {
+          let slot = toolCalls.get(tc.index)
+          if (slot === undefined) {
+            slot = { id: '', name: '', args: '' }
+            toolCalls.set(tc.index, slot)
+          }
+          if (tc.id !== '') slot.id = tc.id
+          if (tc.name !== '') slot.name = tc.name
+          slot.args += tc.args
+        }
+        const u = chatChunkUsage(frame.object)
+        if (u !== undefined) usage = u as Record<string, number>
+        return true
+      }, merged)
+
+      return {
+        text,
+        reasoning,
+        toolCalls: [...toolCalls.values()].map(tc => ({ id: tc.id, name: tc.name, arguments: tc.args })),
+        ...(usage !== undefined ? { usage } : {}),
+        finish,
+      }
     } finally {
       clearTimeout(timer)
     }
