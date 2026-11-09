@@ -13,13 +13,13 @@
   "bugs": {
     "url": "https://github.com/REALOIYO/dsh-deepai-connector/issues"
   },
-  "main": "./src/index.ts",
+  "main": "./lib/index.js",
   "exports": {
     ".": {
-      "default": "./src/index.ts"
+      "default": "./lib/index.js"
     },
     "./client": {
-      "default": "./src/adapter/client.ts"
+      "default": "./lib/client.js"
     },
     "./package.json": "./package.json"
   },

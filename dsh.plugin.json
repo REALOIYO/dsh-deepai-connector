@@ -1,7 +1,11 @@
 {
-  "id": "dsh-deepai-connector",
-  "name": "DeepAI Code",
+  "name": "dsh-deepai-connector",
+  "description": "DeepAI Code 模型接入 DeepSeek Harness：自带浏览器 OAuth 登录，直连上游接口，无需桌面客户端或网关程序",
   "version": "0.1.0",
-  "description": "DeepAI Code 模型接入 DSH：浏览器 OAuth 直连，不需要桌面客户端，也不需要网关进程。",
-  "entry": "./src/index.ts"
+  "entry": {
+    "name": "dsh-deepai-connector",
+    "inject": [
+      "llm"
+    ]
+  }
 }
