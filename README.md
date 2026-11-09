@@ -1,81 +1,73 @@
 # dsh-deepai-connector
 
-把 DeepAI Code 的上游模型接入 DeepSeek Harness。**不需要安装 DeepAI Code 桌面端，也不需要跑额外的网关进程**：取 Key 走浏览器 OAuth，推理由插件进程直连上游，在「设置 → DeepAI Code」里完成一次登录即可。
+[![npm](https://img.shields.io/npm/v/dsh-deepai-connector?style=flat-square)](https://www.npmjs.com/package/dsh-deepai-connector)
+[![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+[![dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-4D6BFE?style=flat-square)](https://github.com/topics/dsh-plugin)
 
-结构与 `dsh-qwenwork-connector` 一致：插件自带账号存储、设置页与 REST 路由，注册成 `dsh-llm` 的 `LlmAdapter`。
+把 DeepAI Code 的上游模型接入 DeepSeek Harness。浏览器授权一次即可，不需要安装 DeepAI Code 桌面客户端，也不需要额外的网关进程。
 
-## 它做的事
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 
-- 浏览器 OAuth 拿 Key（RFC 8252 本机回调，与桌面端同款流程），没有桌面端也能登录；
-- 复刻上游要求的请求头形状：`Api-Key` 鉴权、车道版本、进程实例号、机器指纹、`User-Agent: node`；
-- 推理前自动完成签到（`/theos` 拉 nonce 再回传），这是上游判定「真客户端」的关键；
-- **自己拼请求体、自己读 SSE**，不引任何 LLM SDK：上游会以 `400 This request is not one DeepAI Code sends.` 拒绝异形请求体，命中后按桌面端字段白名单重排一次；
-- 模型目录完全由上游下发，插件只做缓存。
+## 安装
 
-协议细节来自 [2951461586/DeepAICode2API](https://github.com/2951461586/DeepAICode2API) 的逆向实现。
-
-## 装法
-
-```bash
-# 在 DSH profile 目录里
+```sh
 cd ~/.dsh/profiles/desktop
-pnpm add link:<本仓库路径>
+pnpm add dsh-deepai-connector
 ```
 
-或在「设置 → 插件」里从本地目录安装。装完重启 DSH。
+或在「设置 → 插件」里按包名安装。装完重启 DSH。
 
 ## 首次使用
 
-1. 打开「设置 → DeepAI Code」，点「登录」；
-2. 复制授权链接到浏览器，用 **Google 或 Apple** 账号完成授权；
-3. 回到设置页，状态变「已登录」后模型出现在选择器里。
+1. 打开「设置 → DeepAI Code」，点「登录」
+2. 把授权链接复制到浏览器，用 **Google 或 Apple** 账号完成授权
+3. 授权成功后模型自动出现在模型选择器里
+
+## 功能
+
+- 浏览器 OAuth 取 Key（RFC 8252 本机回调），与桌面端同款流程
+- 复刻上游请求头形状：`Api-Key` 鉴权、车道版本、进程实例号、机器指纹、`User-Agent: node`
+- 推理前自动完成签到（`/theos` 拉 nonce 再回传）
+- 自建请求体与 SSE 解析，不依赖任何 LLM SDK
+- 上游以 `400 This request is not one DeepAI Code sends.` 拒绝异形请求体时报错后，按桌面端字段白名单重排一次
+- 模型目录由上游下发，本地只做缓存
 
 ## 已知限制
 
-- **账号要求**：上游自 0.3.19 起只允许 Google/Apple 登录的账号推理。邮箱密码账号会拿到 `403 social_login_required`，重试或换出口都无效。
-- **每日额度按出口 IP 发放**：同一网络下的免费额度是共享池子，领完要等上游给的刷新时间（`403 network_bound` 带 `refresh_at`）。
-- **签到是有限资源**：当天重启签到次数用尽会拿 `403 check_in_refused`，之后推理仍可用，但可能落到替身后端。
-- **可能落到替身分支**：即使协议全对，上游也可能把请求转到一条替身后端。判据是响应里的 `provider` 字段——等于 `"DeepAI"` 就是替身。状态码仍是 200，光看状态码发现不了。
-- **协议会变**：上游每抬一次车道版本就把旧值一律回 `426`。插件内置车道探测，但大改仍需跟进。
+**账号要求**：上游自 0.3.19 起只允许 Google/Apple 登录的账号推理。邮箱密码注册的账号会拿到 `403 social_login_required`，重试或更换网络都无效。
 
-## 关于封号
+**不提供 prompt 缓存**：实测同一段 1028 token 前缀连发三次，`prompt_tokens_details.cached_tokens` 恒为 0，`cache_write_tokens` 亦为 0。DSH 用量面板因此始终显示 0% 命中，属上游行为，非配置问题。
 
-插件的设计目标是**只用自己的账号、不做批量注册、不伪造机器指纹**：
+**额度按出口 IP 发放**：同网络下免费额度为共享池，领完后需等待上游给出的刷新时间（`403 network_bound` 携带 `refresh_at`）。
 
-- 机器指纹读本机真实 UUID（Windows 取 `Win32_ComputerSystemProduct.UUID`，回落到 `MachineGuid`），可用 `DEEPAI_MACHINE_ID` 覆盖；
-- 签到按上游给的最小间隔节流，命中 `check_in_refused` 后静默锁 6 小时，不会反复撞接口；
-- 不带浏览器指纹头（`sec-ch-ua` 等），那会让请求被识别成非客户端。
+**签到为有限资源**：当日重启签到次数用尽后返回 `403 check_in_refused`，推理仍可用，但可能落到替身后端。
 
-这些降低的是「被判定为非客户端」的概率，不构成对封号的保证。上游的处置一贯是降级（换后端、拒绝该次请求、收窄账号资格），插件也没有绕过额度限制的逻辑。
+**可能落到替身后端**：即使协议全部对齐，上游仍可能把请求转到另一条后端。判据是响应中 `usage.cost_details.upstream_inference_cost` 是否大于 0；状态码恒为 200，无法从状态码分辨。
+
+**协议可能变更**：上游每次抬升车道版本即将旧值一律回 `426`。插件内置车道探测，较大改动仍需跟进。
+
+## 与上游账号的关系
+
+插件使用本机真实机器指纹（Windows 取 `Win32_ComputerSystemProduct.UUID`，回落到 `MachineGuid`），仅上传其 sha256 值，不上传原始标识；可用 `DEEPAI_MACHINE_ID` 覆盖。签到按上游要求的最小间隔节流，命中 `check_in_refused` 后静默锁 6 小时。
+
+插件只服务单个自用账号，不含账号池、批量注册或额度绕行逻辑。上述措施降低被判定为非客户端的概率，不构成账号安全的保证。
+
+## 许可与致谢
+
+以 MIT 许可发布，见 [LICENSE](LICENSE)。
+
+协议实现参考 [2951461586/DeepAICode2API](https://github.com/2951461586/DeepAICode2API)（MIT）。该项目的 `docs/recon.md` 记录了上游端点、请求头、签到与错误语义的逆向结果；本插件按其结论重新实现，未使用其代码。
+
+插件形态与服务组织方式参考本人另一项目 [REALOIYO/dsh-qwenwork-connector](https://github.com/REALOIYO/dsh-qwenwork-connector)（MIT）。
 
 ## 开发
 
-```bash
-# esbuild 是构建期依赖，不写进 package.json
+```sh
+# 构建（esbuild 为构建期依赖，不写入 package.json）
 DEEPAI_ESBUILD=<esbuild 目录> node build.mjs
-node --test "test/*.test.ts"        # 65 个用例
+
+# 测试
+node --test "test/*.test.ts"
 ```
 
-产物：`lib/index.js`（Host，ESM）+ `lib/client.js`（浏览器，CJS，套 `window.__ModuleLoader__.load` 外壳）。
-
-测试直接跑 `src/` 下的 `.ts`（Node 22.18+/24 原生支持），不依赖构建产物。
-
-## 目录
-
-```text
-src/index.ts              插件入口：注册适配器、挂 REST 路由
-src/adapter/protocol.ts   上游协议常量与请求头
-src/adapter/machine.ts    机器指纹（三平台）
-src/adapter/auth.ts       浏览器 OAuth + 凭据落盘
-src/adapter/client.ts     上游客户端：签到状态机、chat 请求、错误语义
-src/adapter/body.ts       请求体构造 + 形状兜底
-src/adapter/sse.ts        SSE 逐帧解析 + chat delta 提取
-src/adapter/stream.ts     SSE → DSH chunk 翻译
-src/adapter/catalog.ts    模型目录缓存
-src/adapter/deepai.ts     LlmAdapter 实现
-src/client/               设置页（slots.inject('settings.section')）
-```
-
-## License
-
-MIT
+产物为 `lib/index.js`（Host，ESM）与 `lib/client.js`（浏览器，CJS，套 `window.__ModuleLoader__.load` 外壳）。测试直接运行 `src/` 下的 TypeScript，依赖 Node 22.18+ 的原生类型擦除。
