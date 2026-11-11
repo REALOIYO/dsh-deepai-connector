@@ -16,6 +16,7 @@ import { homedir } from 'node:os'
 
 import { AccountStore, defaultDataDir, startSignIn, type SignInSession, type StoredAccount } from './adapter/auth.ts'
 import { DeepAIClient } from './adapter/client.ts'
+import type { UpstreamModel } from './adapter/client.ts'
 import { DeepAIAdapter, PROVIDER_ID } from './adapter/deepai.ts'
 import { detectMachineFingerprint } from './adapter/machine.ts'
 
@@ -195,6 +196,44 @@ function start(
 }
 
 /**
+ * 发事件，出错不影响调用方。
+ *
+ * 宿主对不感兴趣的事件名是静默忽略，但刷新路由不该因为通知失败就整个失败。
+ */
+function emitSafe(ctx: PluginContext, event: string, ...args: unknown[]): void {
+  try {
+    ctx.emit?.(event, ...args)
+  } catch {
+    // 通知失败只是选择器不重载，刷新本身已经成功了
+  }
+}
+
+/**
+ * 两份目录内容是否一致。
+ *
+ * 刷新按钮会被反复点，内容没变就不广播。只比影响选择器与请求的字段；
+ * 顺序不同算同——上游偶尔调换顺序，不该当成目录变了。
+ */
+function sameCatalog(a: readonly UpstreamModel[], b: readonly UpstreamModel[]): boolean {
+  if (a.length !== b.length) return false
+  const pick = (m: UpstreamModel): string =>
+    JSON.stringify([
+      m.id,
+      m.name ?? '',
+      m.reasoning === true,
+      m.input ?? [],
+      m.contextWindow ?? 0,
+      m.maxTokens ?? 0,
+      m.theosPerRequest ?? '',
+      m.premier === true,
+      m.api ?? '',
+    ])
+  const left = a.map(pick).sort()
+  const right = b.map(pick).sort()
+  return left.every((v, i) => v === right[i])
+}
+
+/**
  * 探车道 + 拉模型目录。
  *
  * 启动时（已登录）与登录成功后各调一次。车道探测失败不阻塞：沿用默认车道，
@@ -363,11 +402,33 @@ function installRoutes(
       // POST /api/deepai/models/refresh — 强制重拉上游目录
       registerRoute(`${API_PREFIX}/models/refresh`, ['POST'], async () => {
         try {
+          const before = adapter.catalog.list()
           await adapter.refreshModels(true)
+          const after = adapter.catalog.list()
+
+          // 目录真的变了才广播：宿主按 `llm/models-updated(provider)` 重载
+          // 模型选择器，已打开的会话选择器会跟着刷新，不用重开设置页。
+          // 内容没变就不发，免得用户停在选择器上被无谓重载。
+          const changed = !sameCatalog(before, after)
+          if (changed) {
+            emitSafe(ctx, 'llm/models-updated', cfg.providerId, {
+              provider: cfg.providerId,
+              count: after.length,
+            })
+            emitSafe(ctx, 'llm/adapters-updated', cfg.providerId, {
+              provider: cfg.providerId,
+              count: after.length,
+            })
+            logger.info(`dsh-deepai-connector: 模型目录已更新，${after.length} 项`)
+          }
+
           return json(200, {
             ok: true,
             live: adapter.catalog.live,
-            models: adapter.catalog.list().map(m => ({ id: m.id, name: m.name ?? m.id })),
+            // 界面据此判断这次刷新到底有没有拿到上游的东西
+            changed,
+            count: after.length,
+            models: after.map(m => ({ id: m.id, name: m.name ?? m.id })),
           })
         } catch (error) {
           return json(500, { ok: false, error: error instanceof Error ? error.message : String(error) })

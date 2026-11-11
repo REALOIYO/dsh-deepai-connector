@@ -43,6 +43,18 @@ interface LoginPayload {
   error?: string
 }
 
+/** 刷新模型目录的响应。 */
+interface RefreshPayload {
+  ok: boolean
+  /** 目录现在是否来自上游实测（false = 还在用内置快照）。 */
+  live?: boolean
+  /** 这次刷新是否真的改变了目录内容。 */
+  changed?: boolean
+  /** 刷新后的模型数。 */
+  count?: number
+  error?: string
+}
+
 /** 单个请求的超时。授权页要在浏览器里点，这里的请求都是短请求。 */
 const REQUEST_TIMEOUT_MS = 15_000
 
@@ -173,6 +185,8 @@ export function DeepAISettings(): React.ReactElement {
   const [loginUrl, setLoginUrl] = useState('')
   const [waiting, setWaiting] = useState(false)
   const [copied, setCopied] = useState(false)
+  /** 上次刷新模型的结果，给用户一个明确反馈（成功/无变化/失败）。 */
+  const [refreshNote, setRefreshNote] = useState('')
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null)
   const loginDeadline = useRef(0)
 
@@ -262,12 +276,28 @@ export function DeepAISettings(): React.ReactElement {
     }
   }, [load])
 
-  /** 强制刷新模型目录。 */
+  /**
+   * 强制刷新模型目录。
+   *
+   * 要给出明确结果：刷新本身看不见摸不着，光重新 load() 一遍，
+   * 用户分不清「刷成功了」「上游没变化」「根本没拉到上游」三种情况。
+   */
   const refreshModels = useCallback(async () => {
     setBusy(true)
+    setRefreshNote('')
     try {
-      await request('/api/deepai/models/refresh', 'POST')
+      const data = await request<RefreshPayload>('/api/deepai/models/refresh', 'POST')
       await load()
+      if (data.live !== true) {
+        // live=false 说明这次没拿到上游目录，仍在用内置快照
+        setError(text('refreshFailedFallback'))
+      } else {
+        setRefreshNote(
+          data.changed === true
+            ? text('refreshChanged', { count: data.count ?? 0 })
+            : text('refreshUnchanged', { count: data.count ?? 0 }),
+        )
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -318,6 +348,7 @@ export function DeepAISettings(): React.ReactElement {
               <Btn disabled={busy} onClick={() => void refreshModels()}>
                 {text('refresh')}
               </Btn>
+              {refreshNote !== '' && <span style={styles.muted}>{refreshNote}</span>}
               <Btn disabled={busy} onClick={() => void logout()}>
                 {text('logout')}
               </Btn>
