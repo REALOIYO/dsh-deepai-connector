@@ -121,6 +121,14 @@ test('usage 解析：Responses 端点的字段名也认', async () => {
   assert.equal(chat?.inputTokens, 10)
   assert.equal(chat?.outputTokens, 5)
 
+  // 带缓存时 inputTokens 只算未命中（DSH 三档互不重叠）
+  const cached = chatChunkUsage({
+    usage: { prompt_tokens: 10, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 7 } },
+  })
+  assert.equal(cached?.inputTokens, 3)
+  assert.equal(cached?.cacheReadTokens, 7)
+  assert.equal((cached?.inputTokens ?? 0) + (cached?.cacheReadTokens ?? 0), 10)
+
   // Responses 端点字段
   const responses = chatChunkUsage({ usage: { input_tokens: 7, output_tokens: 3 } })
   assert.equal(responses?.inputTokens, 7)

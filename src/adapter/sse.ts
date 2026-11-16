@@ -224,29 +224,44 @@ function floatOf(value: unknown): number {
  * 缺失时回落到 `input_tokens`/`output_tokens`（Responses 端点是后者），
  * 思维链 token 从 `completion_tokens_details` 或 `output_tokens_details` 取，
  * 成本优先 `cost`、其次 `cost_details.upstream_inference_cost`。
+ *
+ * ## 缓存命中必须从 prompt 里减掉
+ *
+ * 上游的 `prompt_tokens` 是**含缓存的总量**，而 DSH 的 `TokenUsage` 三档
+ * （`inputTokens` / `cacheReadTokens` / `cacheWriteTokens`）是**互不重叠**的：
+ * 前者只算未命中。原样透传会让缓存部分被计两次，宿主与用量面板的命中率
+ * 因此腰斩（实测 96% 显示成 49%）。
  */
 export function chatChunkUsage(chunk: Record<string, unknown>): ChatUsage | undefined {
   const usage = chunk.usage
   if (usage === null || typeof usage !== 'object') return undefined
   const u = usage as Record<string, unknown>
 
-  let input = intOf(u.prompt_tokens)
+  // 上游报的 prompt 总量（含缓存命中部分）
+  let promptTotal = intOf(u.prompt_tokens)
   let output = intOf(u.completion_tokens)
-  if (input === 0) input = intOf(u.input_tokens)
+  if (promptTotal === 0) promptTotal = intOf(u.input_tokens)
   if (output === 0) output = intOf(u.output_tokens)
 
-  const total = intOf(u.total_tokens) || input + output
+  // 缓存命中量：上游有两条路放这个数
+  let cached = 0
+  const promptDetails = u.prompt_tokens_details
+  if (promptDetails !== null && typeof promptDetails === 'object') {
+    const value = intOf((promptDetails as Record<string, unknown>).cached_tokens)
+    if (value > 0) cached = value
+  }
+  // 缓存不可能超过 prompt 总量；上游偶有脏数，夹住免得算出负的未命中
+  if (cached > promptTotal) cached = promptTotal
+
+  // DSH 语义：inputTokens 只算未命中
+  const input = promptTotal - cached
+
+  const total = intOf(u.total_tokens) || promptTotal + output
   if (input === 0 && output === 0 && total === 0) return undefined
 
   const result: ChatUsage = { inputTokens: input, outputTokens: output }
   if (total > 0) result.totalTokens = total
-
-  // 缓存命中量：上游有两条路放这个数
-  const promptDetails = u.prompt_tokens_details
-  if (promptDetails !== null && typeof promptDetails === 'object') {
-    const cached = intOf((promptDetails as Record<string, unknown>).cached_tokens)
-    if (cached > 0) result.cacheReadTokens = cached
-  }
+  if (cached > 0) result.cacheReadTokens = cached
 
   // 思维链 token
   const completionDetails = u.completion_tokens_details
