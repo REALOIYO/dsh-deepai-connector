@@ -13,6 +13,7 @@ import {
   DESKTOP_INFERENCE_HEADERS,
   LANE_VERSION,
   PATH_CHAT,
+  laneCandidates,
   modelUrl,
 } from '../src/adapter/protocol.ts'
 import {
@@ -44,8 +45,20 @@ test('端点地址拼接', () => {
   assert.equal(modelUrl(PATH_CHAT), 'https://api.deepai.org/deepai_code/chat/completions')
 })
 
-test('车道版本是 4', () => {
-  assert.equal(LANE_VERSION, '4')
+test('车道版本跟着上游门槛走', () => {
+  // 2026-11-17 实测：4 / 5 / 6 全 426，只有 7 → 200
+  assert.equal(LANE_VERSION, '7')
+})
+
+test('车道候选从编译期值起步、向上猜、再回落', () => {
+  // 顺序不能反过来：/models 对旧车道宽容，从旧值起步会钉死在旧车道上
+  assert.deepEqual(laneCandidates('7'), [
+    '7', '8', '9', '10', '11', '12', '13', '6', '5', '4', '3', '2',
+  ])
+  // 第一项必须是编译期值，否则首轮探测先打一个已知失效的车道
+  assert.equal(laneCandidates()[0], LANE_VERSION)
+  // 非法编译值不该把候选表炸掉
+  assert.deepEqual(laneCandidates('abc'), ['abc'])
 })
 
 test('机器指纹是 sha256 小写十六进制', () => {

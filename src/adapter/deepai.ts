@@ -251,7 +251,10 @@ export class DeepAIAdapter {
       return new Error(`deepai: 上游会话繁忙，稍后重试（${error.message}）`)
     }
     if (error.laneUnsupported) {
-      return new Error('deepai: 上游不再接受当前车道版本，插件需要更新。')
+      return new Error(
+        `deepai: 上游已废弃当前车道版本（本插件发 ${this.#client.lane}），自动重探也没找到可用的。` +
+          '上游抬档后通常几小时内出新版，请升级 dsh-deepai-connector。',
+      )
     }
     if (error.checkInRefused) {
       return new Error('deepai: 今日签到次数已用尽（推理仍可用，但可能落到替身后端）。')

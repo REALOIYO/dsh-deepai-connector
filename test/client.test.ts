@@ -13,7 +13,7 @@ import { createServer, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 
 import { DeepAIClient, retryAfterSeconds } from '../src/adapter/client.ts'
-import { modelUrl } from '../src/adapter/protocol.ts'
+import { modelUrl, LANE_VERSION, APP_VERSION } from '../src/adapter/protocol.ts'
 
 /** 一条被记下来的请求。 */
 interface Recorded {
@@ -113,7 +113,7 @@ test('推理请求的头形状：Api-Key / 车道 / 实例 / 指纹 / node UA', 
     assert.ok(sent, '没有发出请求')
     assert.equal(sent.headers['api-key'], 'sk-abc', '鉴权头必须是 Api-Key 而不是 Authorization')
     assert.equal(sent.headers['authorization'], undefined, '不该出现 Authorization 头')
-    assert.equal(sent.headers['x-deepai-code-theos'], '4')
+    assert.equal(sent.headers['x-deepai-code-theos'], LANE_VERSION)
     assert.equal(sent.headers['x-deepai-code-instance'], client.instanceId)
     assert.equal(sent.headers['x-deepai-code-machine'], 'f'.repeat(64))
     assert.equal(sent.headers['user-agent'], 'node', 'UA 必须是 node，否则会被换到替身后端')
@@ -169,8 +169,9 @@ test('theos：先拉 nonce，下一次才回传 Check-In', async () => {
     assert.equal(calls.length, 2)
     assert.equal(calls[0]?.headers['x-deepai-code-check-in'], undefined, '首次不该带 Check-In')
     assert.equal(calls[1]?.headers['x-deepai-code-check-in'], '1'.padStart(32,'0'), '第二次必须回传上一次的 nonce')
-    // 心跳形态
-    assert.match(String(calls[0]?.headers['x-deepai-code-beacon']), /^v=0\.3\.20;up=\d+;pi=[01]$/)
+    // 心跳形态：版本号跟 APP_VERSION 走，不写死
+    const beacon = String(calls[0]?.headers['x-deepai-code-beacon'])
+    assert.match(beacon, new RegExp(`^v=${APP_VERSION.replace(/\./g, '\\.')};up=\\d+;pi=[01]$`))
   } finally {
     await upstream.close()
   }
@@ -217,11 +218,11 @@ test('ensureCheckIn 在签到失败时不阻塞推理', async () => {
   }
 })
 
-test('车道探测：426 时往下试，命中即返回', async () => {
+test('车道探测：只接受 9 时能一路试到 9', async () => {
   const upstream = await fakeUpstream((req, res) => {
     const lane = String(req.headers['x-deepai-code-theos'] ?? '')
-    // 只有 5 能过
-    if (lane === '5') {
+    // 模拟上游抬到 9：7、8 都 426
+    if (lane === '9') {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ data: [] }))
       return
@@ -233,8 +234,34 @@ test('车道探测：426 时往下试，命中即返回', async () => {
   try {
     const client = new DeepAIClient()
     const lane = await withUpstream(upstream.base, () => client.probeLane())
-    assert.equal(lane, '5')
-    assert.equal(client.lane, '5')
+    assert.equal(lane, '9')
+    assert.equal(client.lane, '9')
+    // 起点必须是编译期车道，不能从更旧的值开始
+    assert.equal(upstream.requests[0]?.headers['x-deepai-code-theos'], LANE_VERSION)
+  } finally {
+    await upstream.close()
+  }
+})
+
+test('车道探测：401 说明车道被接受，应当采纳而不是回落', async () => {
+  // 未登录时上游对合法车道回 401 auth_required，对废弃车道回 426。
+  // 早先把 401 当成「问题不在车道」直接回落，会让未登录启动把车道钉死在旧值。
+  const upstream = await fakeUpstream((req, res) => {
+    const lane = String(req.headers['x-deepai-code-theos'] ?? '')
+    if (lane === LANE_VERSION) {
+      res.writeHead(401, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: { code: 'auth_required' } }))
+      return
+    }
+    res.writeHead(426, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ error: { code: 'lane_version_unsupported' } }))
+  })
+
+  try {
+    const client = new DeepAIClient()
+    const lane = await withUpstream(upstream.base, () => client.probeLane())
+    assert.equal(lane, LANE_VERSION)
+    assert.equal(client.lane, LANE_VERSION)
   } finally {
     await upstream.close()
   }
@@ -342,6 +369,91 @@ test('openChat：命中 400 形状拒绝后自动重排重试一次', async () =
     const retried = JSON.parse(bodies[1] ?? '{}') as Record<string, unknown>
     assert.equal('user' in retried, false, '重排后应丢掉白名单外字段')
     assert.equal(retried.store, false, 're 排后仍要有 store')
+  } finally {
+    await upstream.close()
+  }
+})
+
+test('openChat：426 时重探车道并重试一次', async () => {
+  // 模拟上游抬档：旧车道 426，新车道 200。
+  // 关键是不用重启插件就能自愈 —— 这是「上游再抬一档也不至于全废」的保证。
+  const lanes: string[] = []
+  let chatHits = 0
+  const upstream = await fakeUpstream((req, res) => {
+    const lane = String(req.headers['x-deepai-code-theos'] ?? '')
+    lanes.push(lane)
+    if (req.url.includes('/models')) {
+      // 探测：只有 LANE_VERSION + 1 可用
+      const good = String(Number(LANE_VERSION) + 1)
+      if (lane === good) {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ data: [] }))
+      } else {
+        res.writeHead(426, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: { code: 'lane_version_unsupported' } }))
+      }
+      return
+    }
+    chatHits += 1
+    if (chatHits === 1) {
+      res.writeHead(426, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: { code: 'lane_version_unsupported' } }))
+      return
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.end('data: [DONE]\n\n')
+  })
+
+  try {
+    const client = new DeepAIClient()
+    client.setApiKey('sk-abc')
+    await withUpstream(upstream.base, async () => {
+      const { buildChatBody } = await import('../src/adapter/body.ts')
+      const options = chatOptions() as Parameters<typeof buildChatBody>[0]
+      const body = buildChatBody(options, 'glm-5.3-flash')
+      const result = await client.openChat(options, 'glm-5.3-flash', body)
+      await result.body.cancel()
+    })
+
+    assert.equal(chatHits, 2, '应当重试一次')
+    const good = String(Number(LANE_VERSION) + 1)
+    assert.equal(client.lane, good, '车道应被更新')
+    assert.ok(lanes.includes(good), '探测过程里应当真的打到了新车道')
+  } finally {
+    await upstream.close()
+  }
+})
+
+test('openChat：426 重探后车道没变就不重试', async () => {
+  // 所有候选都 426（上游门槛越过猜测上限）时，不该拿同一条车道反复打。
+  let chatHits = 0
+  const upstream = await fakeUpstream((req, res) => {
+    if (req.url.includes('/models')) {
+      res.writeHead(426, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: { code: 'lane_version_unsupported' } }))
+      return
+    }
+    chatHits += 1
+    res.writeHead(426, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ error: { code: 'lane_version_unsupported' } }))
+  })
+
+  try {
+    const client = new DeepAIClient()
+    client.setApiKey('sk-abc')
+    const error = await withUpstream(upstream.base, async () => {
+      const { buildChatBody } = await import('../src/adapter/body.ts')
+      const options = chatOptions() as Parameters<typeof buildChatBody>[0]
+      const body = buildChatBody(options, 'm')
+      return client.openChat(options, 'm', body).then(
+        () => null,
+        (e: unknown) => e as Error,
+      )
+    })
+
+    assert.ok(error !== null, '应当抛错')
+    assert.equal(chatHits, 1, '车道没变时不该重试')
+    assert.equal(client.lane, LANE_VERSION, '全 426 时保留原值')
   } finally {
     await upstream.close()
   }

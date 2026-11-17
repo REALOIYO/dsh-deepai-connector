@@ -15,14 +15,15 @@ import {
   isValidCheckIn,
   retryAfterSeconds,
 } from '../src/adapter/client.ts'
-import { LANE_CANDIDATES, LANE_VERSION } from '../src/adapter/protocol.ts'
+import { LANE_VERSION, laneCandidates } from '../src/adapter/protocol.ts'
 
-test('车道候选与 Go 的 LaneCandidates 逐项一致', () => {
-  // internal/deepai/client.go:399
-  assert.deepEqual([...LANE_CANDIDATES], ['4', '5', '6', '7', '8', '9', '10', '11', '12', '3', '2'])
-  assert.equal(LANE_VERSION, '4')
+test('车道候选与 Go 的 laneCandidates 同序', () => {
+  // internal/deepai/client.go:445 laneCandidates()
+  // 编译期车道优先 → 向上猜 6 个 → 再回落到 2
+  assert.deepEqual([...laneCandidates('7')], ['7', '8', '9', '10', '11', '12', '13', '6', '5', '4', '3', '2'])
+  assert.equal(LANE_VERSION, '7')
   // 默认车道必须在候选里，否则首轮探测必然白跑一次
-  assert.equal(LANE_CANDIDATES.includes(LANE_VERSION), true)
+  assert.equal(laneCandidates().includes(LANE_VERSION), true)
 })
 
 test('CheckIn 有效性：nonce 必须是 32 位小写十六进制', () => {

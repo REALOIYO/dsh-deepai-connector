@@ -33,12 +33,12 @@ import {
   HEADER_KEY,
   HEADER_LANE,
   HEADER_MACHINE,
-  LANE_CANDIDATES,
   LANE_VERSION,
   PATH_CHAT,
   PATH_MODELS,
   PATH_RESPONSES,
   PATH_THEOS,
+  laneCandidates,
   modelUrl,
 } from './protocol.ts'
 
@@ -52,6 +52,15 @@ const CHECK_IN_MIN_INTERVAL_MS = 30_000
 
 /** 单次签到的时间预算：签到只是上下文，失败不该阻塞推理。 */
 const CHECK_IN_TIMEOUT_MS = 10_000
+
+/**
+ * 两次车道探测之间的最小间隔。
+ *
+ * 车道不对时 426 会成批出现（并发请求同时撞上）；没有冷却，一次车道升级
+ * 就会把每个失败请求都变成一次 `/models` 探测。与 `DeepAICode2API` 的
+ * `laneProbeCooldown` 取同值（60 秒）。
+ */
+const LANE_PROBE_COOLDOWN_MS = 60_000
 
 /**
  * 命中 `check_in_refused` 后的静默锁时长。
@@ -282,6 +291,8 @@ export class DeepAIClient {
   #machine: string
   #apiKey = ''
   #lane: string
+  /** 上次车道探测时刻，`0` 表示还没探过。用于冷却。 */
+  #laneCheckedAt = 0
   readonly #checkIns = new Map<string, CheckInState>()
 
   constructor(options: { machine?: string; lane?: string } = {}) {
@@ -404,13 +415,21 @@ export class DeepAIClient {
   /**
    * 探测可用车道版本。
    *
-   * 上游每抬一次车道就把旧值一律回 426。按「新版优先、旧版兜底」试，
-   * 命中即落盘，这样上游升级车道时插件不需要改代码。
+   * 上游每抬一次车道就把旧值一律回 426。按「编译期值优先、向上猜、旧值兜底」
+   * 试：命中即用，这样上游升级车道时插件不需要改代码。
+   *
+   * 判「这个车道可用」的口径有两个，不只是 2xx：
+   *   - `2xx` —— 明摆着可用；
+   *   - `401` —— 路由已经接受了该车道，只是没带 Key（上游 2026-11-14 起
+   *     对 `/models` 也要求 Api-Key）。**不能**把它当成「车道不对」，
+   *     否则未登录时探测会把车道永久钉在旧值上。
+   *
+   * 只有 426 才继续试下一个候选；5xx 与网络错误说明问题不在车道，
+   * 保留原值直接返回，避免拿一次抖动把车道改坏。
    */
   async probeLane(signal?: AbortSignal): Promise<string> {
-    const candidates = LANE_CANDIDATES
     const previous = this.#lane
-    for (const lane of candidates) {
+    for (const lane of laneCandidates()) {
       this.#lane = lane
       try {
         const response = await fetch(modelUrl(PATH_MODELS), {
@@ -420,7 +439,7 @@ export class DeepAIClient {
           redirect: 'manual',
         })
         if (response.ok) return lane
-        // 426 说明这个车道不对，继续试下一个；其它错误说明问题不在车道。
+        if (response.status === 401) return lane
         if (response.status !== 426) {
           this.#lane = previous
           return previous
@@ -430,8 +449,28 @@ export class DeepAIClient {
         return previous
       }
     }
-    this.#lane = LANE_VERSION
-    return LANE_VERSION
+    // 所有候选都被 426：上游门槛越过了猜测上限。保留原值比盲目改更保守，
+    // 下一次真正失败时还会触发重探。
+    this.#lane = previous
+    return previous
+  }
+
+  /**
+   * 带冷却的车道重探。
+   *
+   * 车道不对时 426 会成批出现（所有并发请求同时撞上）；没有冷却，
+   * 一次车道升级就会把每个失败请求都变成一次 `/models` 探测。
+   * 冷却值与 `DeepAICode2API` 的 `laneProbeCooldown` 一致（60 秒）。
+   *
+   * @returns 探测后生效的车道；冷却期内直接返回当前值。
+   */
+  async revalidateLane(signal?: AbortSignal): Promise<string> {
+    const now = Date.now()
+    if (this.#laneCheckedAt > 0 && now - this.#laneCheckedAt < LANE_PROBE_COOLDOWN_MS) {
+      return this.#lane
+    }
+    this.#laneCheckedAt = now
+    return this.probeLane(signal)
   }
 
   /** 给 `/theos` 加签到头与心跳。 */
@@ -600,6 +639,19 @@ export class DeepAIClient {
         const retry = await this.#postChat(fallback, signal, affinity)
         if (retry.ok) return this.#toChatResult(retry, signal)
         throw await this.#toError(retry, '形状回退后请求 chat')
+      }
+    }
+
+    // 426：上游抬了车道门槛。重探一次，车道确实变了才重试 —— 且只重试一次。
+    // 探测打 `/models`（不消耗 Theos、不触发签到），重试是一次正常推理请求，
+    // 两者都不会额外增加风控面。车道没变说明不是车道问题，原样抛出。
+    if (error.laneUnsupported) {
+      const before = this.#lane
+      await this.revalidateLane(signal).catch(() => before)
+      if (this.#lane !== before) {
+        const retry = await this.#postChat(body, signal, affinity)
+        if (retry.ok) return this.#toChatResult(retry, signal)
+        throw await this.#toError(retry, '车道重探后请求 chat')
       }
     }
 

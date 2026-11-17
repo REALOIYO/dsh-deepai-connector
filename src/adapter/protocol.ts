@@ -40,23 +40,45 @@ export function origin(env: NodeJS.ProcessEnv = process.env): string {
 export const MODEL_BASE = '/deepai_code'
 
 /**
- * 车道探测的候选序列。
+ * 车道版本。上游每抬一次就把旧值一律回 426。
  *
- * 上游每抬一次车道就把旧值一律回 426（0.3.17 是 2，0.3.19 起是 4）。
- * 按「新版优先、旧版兜底」试：命中即用，这样上游升级车道时插件不需要改代码。
- *
- * 与 `DeepAICode2API` 的 `LaneCandidates` 逐项一致 —— 少一个候选就在上游
- * 抬到那一档时探测失败。
+ * 历次门槛（均为实测）：0.3.17 是 2，0.3.19 起 4，0.3.36 起 5，
+ * 0.3.37 起 6，2026-11-17 实测已到 **7**（4 / 5 / 6 一律 426）。
  */
-export const LANE_CANDIDATES: readonly string[] = Object.freeze([
-  '4', '5', '6', '7', '8', '9', '10', '11', '12', '3', '2',
-])
+export const LANE_VERSION = '7'
 
-/** 车道版本。上游每抬一次就把旧值一律回 426。 */
-export const LANE_VERSION = '4'
+/**
+ * 探测时向上猜测的步数。
+ *
+ * 与 `DeepAICode2API` 的 `laneGuessAhead` 同值：上游可能先抬车道再发客户端，
+ * 留几个余量就不必每次抬档都改代码。
+ */
+export const LANE_GUESS_AHEAD = 6
 
-/** 应用版本号，只出现在 `/theos` 的心跳 `v=` 字段里。 */
-export const APP_VERSION = '0.3.20'
+/**
+ * 车道探测的候选序列：编译期车道优先 → 向上猜 → 最后回落到 2。
+ *
+ * 顺序**不能反过来**。`/models` 对旧车道很宽容（0.3.37 时 5 / 6 都回 200），
+ * 从旧值开始试会第一次就钉在旧车道上，而不同车道的目录并不相同
+ * （车道 6 把 27 个模型的 `contextWindow` 收敛到 320000）。这也正是
+ * `DeepAICode2API` 在 v0.1.6 把静态 `LaneCandidates` 改成本函数的原因。
+ */
+export function laneCandidates(compiled: string = LANE_VERSION): readonly string[] {
+  const base = Number.parseInt(compiled, 10)
+  if (!Number.isFinite(base)) return [compiled]
+  const out: string[] = []
+  for (let lane = base; lane <= base + LANE_GUESS_AHEAD; lane += 1) out.push(String(lane))
+  for (let lane = base - 1; lane >= 2; lane -= 1) out.push(String(lane))
+  return out
+}
+
+/**
+ * 应用版本号，只出现在 `/theos` 的心跳 `v=` 字段里。
+ *
+ * 上游用它在签到侧识别客户端版本。不参与 wire protocol 判定，
+ * 但自报一个已被淘汰的版本号没有意义，跟着桌面端走即可。
+ */
+export const APP_VERSION = '0.3.37'
 
 /** 鉴权头。上游统一使用 `Api-Key`（大小写不敏感）。 */
 export const HEADER_KEY = 'Api-Key'
